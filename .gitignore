@@ -1,0 +1,15 @@
+# Python venv
+.venv/
+venv/
+
+# Python 編譯檔
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# 系統檔案
+.DS_Store
+
+# 環境變數檔
+.env
