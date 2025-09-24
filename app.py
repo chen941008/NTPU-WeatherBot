@@ -19,6 +19,10 @@ CHANNEL_TOKEN = os.getenv("LINE_CHANNEL_ACCESS_TOKEN")
 configuration = Configuration(access_token=CHANNEL_TOKEN)
 parser = WebhookParser(CHANNEL_SECRET)
 
+# ✅ 健康檢查路由：Render/你自己可用來預熱或監測
+@app.get("/health")
+def health():
+    return "OK"
 
 @app.route("/webhook", methods=['POST'])
 def webhook():
@@ -49,4 +53,5 @@ def webhook():
 
 
 if __name__ == "__main__":
-    app.run(port=3000)
+    port = int(os.getenv("PORT", 3000))
+    app.run(host="0.0.0.0", port=port, debug=False)
