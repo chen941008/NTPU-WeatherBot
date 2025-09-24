@@ -1,0 +1,6 @@
+flask
+gunicorn
+line-bot-sdk==3.*
+python-dotenv
+requests
+certifi
