@@ -1,23 +1,20 @@
 # app.py
 import os
-import certifi
-
-# 讓 requests / urllib3 一律用 certifi 憑證（避免雲端 SSL 驗證問題）
-os.environ["SSL_CERT_FILE"] = certifi.where()
-os.environ["REQUESTS_CA_BUNDLE"] = certifi.where()
-
 import requests
+import certifi
 from flask import Flask, request
 from dotenv import load_dotenv
 
-# line-bot-sdk v3
+# LINE Bot SDK v3
 from linebot.v3.webhook import WebhookParser
 from linebot.v3.messaging import (
     Configuration, ApiClient, MessagingApi,
     ReplyMessageRequest, TextMessage,
 )
 
+# 讀 .env（本地會有；雲端 Render 即使沒有也不影響）
 load_dotenv()
+
 app = Flask(__name__)
 
 CHANNEL_SECRET = os.getenv("LINE_CHANNEL_SECRET")
@@ -48,7 +45,7 @@ def normalize_city(text: str) -> str:
         return "臺北市"
     return CITY_ALIASES.get(text, text)
 
-# ---- 呼叫中央氣象署「今明36小時」(F-C0032-001) ----
+# ---- CWA 36 小時預報（穩健 SSL 策略：默認驗證 → 失敗再降級；本地可環境變數強制跳過） ----
 def get_weather_36h(location="臺北市") -> str:
     if not CWA_API_KEY:
         return "尚未設定 CWA_API_KEY，請先在環境變數加入中央氣象署金鑰。"
@@ -56,18 +53,24 @@ def get_weather_36h(location="臺北市") -> str:
     url = "https://opendata.cwa.gov.tw/api/v1/rest/datastore/F-C0032-001"
     params = {"Authorization": CWA_API_KEY, "locationName": location}
 
-    # 本機或強制關閉時，直接不驗證
-    force_insecure = bool(os.getenv("CWA_INSECURE"))
-    tries = [(not force_insecure, certifi.where())]  # (do_verify, verify_arg)
+    # 用 session 並關閉對系統環境變數的信任，避免被外部 CA 變數干擾
+    s = requests.Session()
+    s.trust_env = False
 
-    # 若不是強制關閉，失敗再 fallback 一次 verify=False
-    if not force_insecure:
-        tries.append((False, False))
+    force_insecure = bool(os.getenv("CWA_INSECURE"))  # 本地可設 1
+    attempts = []
+
+    if force_insecure:
+        # 本地開發：直接不驗證，最穩（雲端不要設這個）
+        attempts = [(False, False)]
+    else:
+        # 雲端/正式：先用 certifi 驗證；若遇到特定 SSL 錯再降級一次
+        attempts = [(True, certifi.where()), (False, False)]
 
     last_err = None
-    for do_verify, verify_arg in tries:
+    for do_verify, verify_arg in attempts:
         try:
-            r = requests.get(url, params=params, timeout=10, verify=verify_arg)
+            r = s.get(url, params=params, timeout=12, verify=verify_arg)
             r.raise_for_status()
             data = r.json()
             locs = data.get("records", {}).get("location", [])
@@ -75,10 +78,10 @@ def get_weather_36h(location="臺北市") -> str:
                 return f"查不到「{location}」的天氣資訊。"
 
             loc = locs[0]
-            wx   = loc["weatherElement"][0]["time"][0]["parameter"]["parameterName"]
-            pop  = loc["weatherElement"][1]["time"][0]["parameter"]["parameterName"]
+            wx   = loc["weatherElement"][0]["time"][0]["parameter"]["parameterName"]  # 天氣現象
+            pop  = loc["weatherElement"][1]["time"][0]["parameter"]["parameterName"]  # 降雨機率
             minT = loc["weatherElement"][2]["time"][0]["parameter"]["parameterName"]
-            ci   = loc["weatherElement"][3]["time"][0]["parameter"]["parameterName"]
+            ci   = loc["weatherElement"][3]["time"][0]["parameter"]["parameterName"]  # 舒適度
             maxT = loc["weatherElement"][4]["time"][0]["parameter"]["parameterName"]
 
             return (f"{location} 今明短期預報：\n"
@@ -87,7 +90,7 @@ def get_weather_36h(location="臺北市") -> str:
                     f"・溫度：{minT}°C ~ {maxT}°C\n"
                     f"・體感/舒適度：{ci}")
         except requests.exceptions.SSLError as e:
-            app.logger.warning(f"CWA SSL verify failed (verify={do_verify}). Will fallback if possible. err={e}")
+            app.logger.warning(f"CWA SSL verify failed (verify={do_verify}). fallback if possible. err={e}")
             last_err = e
             continue
         except requests.exceptions.RequestException as e:
@@ -97,10 +100,8 @@ def get_weather_36h(location="臺北市") -> str:
             app.logger.error(f"CWA parse error: {e}")
             return "天氣資料解析失敗，稍後再試。"
 
-    # 都失敗
     app.logger.error(f"CWA SSL still failing after fallback: {last_err}")
     return "氣象資料連線失敗，稍後再試。"
-
 
 # ✅ 健康檢查（Render 會定期打）
 @app.get("/health")
@@ -112,7 +113,7 @@ def webhook():
     signature = request.headers.get('X-Line-Signature', '')
     body = request.get_data(as_text=True) or ""
 
-    # 讓 LINE Verify/健康檢查通過（無簽章或空 body 直接 200）
+    # 讓 LINE 後台 Verify / 健康檢查通過（無簽章或空 body 直接 200）
     if not signature or not body.strip():
         return "OK"
 
