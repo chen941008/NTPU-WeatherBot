@@ -56,35 +56,51 @@ def get_weather_36h(location="臺北市") -> str:
     url = "https://opendata.cwa.gov.tw/api/v1/rest/datastore/F-C0032-001"
     params = {"Authorization": CWA_API_KEY, "locationName": location}
 
-    # 本機可設 CWA_INSECURE=1 來關閉驗證；雲端（Render）不要設，使用 certifi 憑證
-    verify_ssl = False if os.getenv("CWA_INSECURE") else certifi.where()
+    # 本機或強制關閉時，直接不驗證
+    force_insecure = bool(os.getenv("CWA_INSECURE"))
+    tries = [(not force_insecure, certifi.where())]  # (do_verify, verify_arg)
 
-    try:
-        r = requests.get(url, params=params, timeout=10, verify=verify_ssl)
-        r.raise_for_status()
-        data = r.json()
-        locs = data.get("records", {}).get("location", [])
-        if not locs:
-            return f"查不到「{location}」的天氣資訊。"
+    # 若不是強制關閉，失敗再 fallback 一次 verify=False
+    if not force_insecure:
+        tries.append((False, False))
 
-        loc = locs[0]
-        wx   = loc["weatherElement"][0]["time"][0]["parameter"]["parameterName"]  # 天氣現象
-        pop  = loc["weatherElement"][1]["time"][0]["parameter"]["parameterName"]  # 降雨機率
-        minT = loc["weatherElement"][2]["time"][0]["parameter"]["parameterName"]
-        ci   = loc["weatherElement"][3]["time"][0]["parameter"]["parameterName"]  # 舒適度
-        maxT = loc["weatherElement"][4]["time"][0]["parameter"]["parameterName"]
+    last_err = None
+    for do_verify, verify_arg in tries:
+        try:
+            r = requests.get(url, params=params, timeout=10, verify=verify_arg)
+            r.raise_for_status()
+            data = r.json()
+            locs = data.get("records", {}).get("location", [])
+            if not locs:
+                return f"查不到「{location}」的天氣資訊。"
 
-        return (f"{location} 今明短期預報：\n"
-                f"・天氣：{wx}\n"
-                f"・降雨機率：{pop}%\n"
-                f"・溫度：{minT}°C ~ {maxT}°C\n"
-                f"・體感/舒適度：{ci}")
-    except requests.exceptions.RequestException as e:
-        app.logger.error(f"CWA request error: {e}")
-        return "氣象資料連線失敗，稍後再試。"
-    except Exception as e:
-        app.logger.error(f"CWA parse error: {e}")
-        return "天氣資料解析失敗，稍後再試。"
+            loc = locs[0]
+            wx   = loc["weatherElement"][0]["time"][0]["parameter"]["parameterName"]
+            pop  = loc["weatherElement"][1]["time"][0]["parameter"]["parameterName"]
+            minT = loc["weatherElement"][2]["time"][0]["parameter"]["parameterName"]
+            ci   = loc["weatherElement"][3]["time"][0]["parameter"]["parameterName"]
+            maxT = loc["weatherElement"][4]["time"][0]["parameter"]["parameterName"]
+
+            return (f"{location} 今明短期預報：\n"
+                    f"・天氣：{wx}\n"
+                    f"・降雨機率：{pop}%\n"
+                    f"・溫度：{minT}°C ~ {maxT}°C\n"
+                    f"・體感/舒適度：{ci}")
+        except requests.exceptions.SSLError as e:
+            app.logger.warning(f"CWA SSL verify failed (verify={do_verify}). Will fallback if possible. err={e}")
+            last_err = e
+            continue
+        except requests.exceptions.RequestException as e:
+            app.logger.error(f"CWA request error: {e}")
+            return "氣象資料連線失敗，稍後再試。"
+        except Exception as e:
+            app.logger.error(f"CWA parse error: {e}")
+            return "天氣資料解析失敗，稍後再試。"
+
+    # 都失敗
+    app.logger.error(f"CWA SSL still failing after fallback: {last_err}")
+    return "氣象資料連線失敗，稍後再試。"
+
 
 # ✅ 健康檢查（Render 會定期打）
 @app.get("/health")
