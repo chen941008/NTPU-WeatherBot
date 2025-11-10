@@ -1,10 +1,13 @@
 import os
 import requests
 import certifi
-import sqlite3
+# import sqlite3  # ⭐️ 移除：不再使用 sqlite3
 import datetime
 from flask import Flask, request
 from dotenv import load_dotenv
+
+# ⭐️ 新增：Flask-SQLAlchemy
+from flask_sqlalchemy import SQLAlchemy
 
 # ⭐️ 新增：Google AI (Gemini)
 import google.generativeai as genai
@@ -23,8 +26,27 @@ app = Flask(__name__)
 CHANNEL_SECRET = os.getenv("LINE_CHANNEL_SECRET")
 CHANNEL_TOKEN  = os.getenv("LINE_CHANNEL_ACCESS_TOKEN")
 CWA_API_KEY    = os.getenv("CWA_API_KEY")
-GOOGLE_API_KEY = os.getenv("GOOGLE_API_KEY") # ⭐️ 新增：Gemini 金鑰
-DB_NAME = "bot.db"
+GOOGLE_API_KEY = os.getenv("GOOGLE_API_KEY")
+# DB_NAME = "bot.db" # ⭐️ 移除：不再需要
+
+# ⭐️ ---- 1.1 ⭐️ 新增：SQLAlchemy 資料庫設定 ----
+# 這會自動讀取你在 Render 上設定的 DATABASE_URL 環境變數
+database_url = os.environ.get('DATABASE_URL')
+if database_url and database_url.startswith("postgres://"):
+    # Render 的 URL 是 'postgres://' 開頭，SQLAlchemy 1.4+ 需要 'postgresql://'
+    database_url = database_url.replace("postgres://", "postgresql://", 1)
+
+# 如果在本地執行 (沒有 DATABASE_URL)，則使用一個本地的 sqlite 檔案 (方便測試)
+if not database_url:
+    app.logger.warning("DATABASE_URL not set, using local sqlite.db for development.")
+    # 注意：本地測試用的檔案會叫做 local_bot.db
+    database_url = "sqlite:///local_bot.db"
+
+app.config['SQLALCHEMY_DATABASE_URI'] = database_url
+app.config['SQLALCHEMY_TRACK_MODIFICATIONS'] = False
+db = SQLAlchemy(app)
+# -----------------------------------------------
+
 
 # LINE Bot 初始化
 configuration = Configuration(access_token=CHANNEL_TOKEN)
@@ -43,165 +65,156 @@ else:
     app.logger.warning("GOOGLE_API_KEY not set. AI functions will be disabled.")
 
 
-# ---- 2. 資料庫 (SQLite) 相關功能 ----
+# ⭐️ ---- 2. ⭐️ 新增：SQLAlchemy 資料庫模型 (Models) ----
+# 這會取代你原本的 CREATE TABLE
+class User(db.Model):
+    __tablename__ = 'users'
+    # 欄位定義
+    line_user_id = db.Column(db.String, primary_key=True)
+    preferences = db.Column(db.Text, nullable=True)
+    last_updated = db.Column(db.DateTime, onupdate=datetime.datetime.now)
+    home_city = db.Column(db.String, nullable=True)
 
-def init_db():
-    """
-    初始化資料庫，建立資料表並新增 home_city 欄位 (如果不存在)
-    """
-    try:
-        with sqlite3.connect(DB_NAME) as conn:
-            cursor = conn.cursor()
-            # 建立使用者偏好表
-            cursor.execute("""
-                CREATE TABLE IF NOT EXISTS users (
-                    line_user_id TEXT PRIMARY KEY,
-                    preferences TEXT,
-                    last_updated TIMESTAMP
-                )
-            """)
-            
-            # ⭐️ 檢查並新增 home_city 欄位 (安全的新增)
-            try:
-                cursor.execute("ALTER TABLE users ADD COLUMN home_city TEXT")
-                conn.commit()
-                app.logger.info("Added 'home_city' column to 'users' table.")
-            except sqlite3.OperationalError as e:
-                if "duplicate column name" in str(e):
-                    app.logger.info("'home_city' column already exists, skipping.")
-                else:
-                    raise # 拋出其他 SQL 錯誤
-            
-            # 建立聊天紀錄表
-            cursor.execute("""
-                CREATE TABLE IF NOT EXISTS chat_history (
-                    message_id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    line_user_id TEXT,
-                    role TEXT,
-                    content TEXT,
-                    timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-                )
-            """)
-            conn.commit()
-            app.logger.info("Database initialized (users, chat_history tables).")
-    except Exception as e:
-        app.logger.error(f"Error initializing database: {e}")
+class ChatHistory(db.Model):
+    __tablename__ = 'chat_history'
+    # 欄位定義
+    message_id = db.Column(db.Integer, primary_key=True, autoincrement=True)
+    line_user_id = db.Column(db.String, index=True) # ⭐️ 加上 index 查詢會更快
+    role = db.Column(db.String)
+    content = db.Column(db.Text)
+    timestamp = db.Column(db.DateTime, default=datetime.datetime.now)
+
+
+# ⭐️ ---- 2.1 ⭐️ 資料庫 (SQLAlchemy) 相關功能 ----
+# 所有的函式都重寫了，不再使用 sqlite3
 
 def save_user_preference(user_id: str, new_pref: str) -> str:
     """
-    ⭐️ 儲存或更新使用者的「固定偏好」 (來自 "記住我" 指令)
-    ⭐️ 新邏輯：用 "換行" 來附加新偏好，而不是覆蓋
+    ⭐️ 儲存或更新使用者的「固定偏好」 (使用 SQLAlchemy)
     """
     if not user_id: return "無法識別使用者 ID。"
     
-    # 1. 先取得舊的偏好
-    current_prefs = get_user_preference(user_id)
-    
-    # 2. 組合新的偏好字串
-    final_prefs = ""
-    if current_prefs == "尚未設定" or current_prefs == "讀取偏好時發生錯誤":
-        # 如果是空的或錯誤，就用新的偏好
-        final_prefs = new_pref
-    else:
-        # 否則，用換行符號附加
-        final_prefs = current_prefs + "\n" + new_pref
-        
-    # 3. 儲存回資料庫
     try:
-        with sqlite3.connect(DB_NAME) as conn:
-            cursor = conn.cursor()
-            cursor.execute("""
-                INSERT INTO users (line_user_id, preferences, last_updated)
-                VALUES (?, ?, ?)
-                ON CONFLICT(line_user_id) DO UPDATE SET
-                    preferences = excluded.preferences,
-                    last_updated = excluded.last_updated
-            """, (user_id, final_prefs, datetime.datetime.now())) # 儲存組合後的 final_prefs
-            conn.commit()
+        # 1. 先取得使用者物件 (如果不存在，等等會建立)
+        # ⭐️ db.session.get() 是 SQLAlchemy 取代 SELECT ... WHERE id=? 的方法
+        user = db.session.get(User, user_id)
+        
+        final_prefs = ""
+        if not user:
+            # ⭐️ 如果使用者不存在，建立一個新的
+            final_prefs = new_pref
+            user = User(
+                line_user_id=user_id, 
+                preferences=final_prefs, 
+                last_updated=datetime.datetime.now()
+            )
+            db.session.add(user) # ⭐️ 加入到 session 準備新增
+        else:
+            # ⭐️ 如果使用者存在，附加偏好
+            current_prefs = user.preferences
+            if not current_prefs:
+                final_prefs = new_pref
+            else:
+                final_prefs = current_prefs + "\n" + new_pref
+            
+            user.preferences = final_prefs # ⭐️ 更新物件
+            user.last_updated = datetime.datetime.now()
+            
+        db.session.commit() # ⭐️ 執行資料庫交易
+        
         app.logger.info(f"Appended preference for user {user_id}")
         return f"我記住了：「{new_pref}」\n\n（點選「我的偏好」查看全部）"
+        
     except Exception as e:
+        db.session.rollback() # ⭐️ 發生錯誤時回滾
         app.logger.error(f"Error saving preference for user {user_id}: {e}")
         return "抱歉，儲存喜好時發生錯誤。"
 
 def get_user_preference(user_id: str) -> str:
     """
-    從資料庫讀取使用者的「固定偏好」
+    從資料庫讀取使用者的「固定偏好」 (使用 SQLAlchemy)
     """
     if not user_id: return ""
     try:
-        with sqlite3.connect(DB_NAME) as conn:
-            cursor = conn.cursor()
-            cursor.execute("SELECT preferences FROM users WHERE line_user_id = ?", (user_id,))
-            row = cursor.fetchone()
-            # ⭐️ 如果 row[0] (preferences) 有值，就回傳；否則回傳 "尚未設定"
-            return row[0] if row and row[0] else "尚未設定"
+        # ⭐️ 透過 Primary Key (user_id) 取得使用者
+        user = db.session.get(User, user_id)
+        
+        # ⭐️ 如果 user 存在且 preferences 有值
+        return user.preferences if user and user.preferences else "尚未設定"
+        
     except Exception as e:
         app.logger.error(f"Error getting preference for user {user_id}: {e}")
         return "讀取偏好時發生錯誤"
 
 def clear_user_preference(user_id: str) -> str:
     """
-    ⭐️ 新增：清除使用者的「固定偏好」
+    ⭐️ 清除使用者的「固定偏好」 (使用 SQLAlchemy)
     """
     if not user_id: return "無法識別使用者 ID。"
     
     try:
-        with sqlite3.connect(DB_NAME) as conn:
-            cursor = conn.cursor()
-            # ⭐️ 將 preferences 欄位設為 NULL (空)
-            cursor.execute("""
-                UPDATE users
-                SET preferences = NULL, last_updated = ?
-                WHERE line_user_id = ?
-            """, (datetime.datetime.now(), user_id))
-            conn.commit()
+        user = db.session.get(User, user_id)
+        
+        if user:
+            user.preferences = None # ⭐️ 設為 None (即資料庫中的 NULL)
+            user.last_updated = datetime.datetime.now()
+            db.session.commit() # ⭐️ 儲存變更
+            
         app.logger.info(f"Cleared preferences for user {user_id}")
         return "我已經忘記你所有的偏好了。"
+        
     except Exception as e:
+        db.session.rollback() # ⭐️ 回滾
         app.logger.error(f"Error clearing preference for user {user_id}: {e}")
         return "抱歉，清除偏好時發生錯誤。"
 
 def add_chat_history(user_id: str, role: str, content: str):
     """
-    新增一筆對話紀錄到資料庫
-    role 應為 'user' (使用者) 或 'bot' (AI)
+    新增一筆對話紀錄到資料庫 (使用 SQLAlchemy)
     """
     if not user_id or not content: return
     try:
-        with sqlite3.connect(DB_NAME) as conn:
-            cursor = conn.cursor()
-            cursor.execute("""
-                INSERT INTO chat_history (line_user_id, role, content, timestamp)
-                VALUES (?, ?, ?, ?)
-            """, (user_id, role, content, datetime.datetime.now()))
-            conn.commit()
+        # ⭐️ 建立一個新的 ChatHistory 物件
+        new_chat = ChatHistory(
+            line_user_id=user_id,
+            role=role,
+            content=content,
+            timestamp=datetime.datetime.now()
+        )
+        db.session.add(new_chat) # ⭐️ 加入
+        db.session.commit() # ⭐️ 儲存
+        
     except Exception as e:
+        db.session.rollback()
         app.logger.error(f"Error adding chat history for user {user_id}: {e}")
 
 def get_chat_history(user_id: str, limit: int = 10) -> list:
     """
-    取得使用者最近的 N 筆聊天紀錄
+    取得使用者最近的 N 筆聊天紀錄 (使用 SQLAlchemy 2.0 語法)
     """
     if not user_id: return []
     try:
-        with sqlite3.connect(DB_NAME) as conn:
-            conn.row_factory = sqlite3.Row
-            cursor = conn.cursor()
-            cursor.execute("""
-                SELECT role, content FROM chat_history
-                WHERE line_user_id = ? ORDER BY timestamp DESC LIMIT ?
-            """, (user_id, limit))
-            rows = cursor.fetchall()
-            history = [(row['role'], row['content']) for row in rows]
-            return list(reversed(history)) 
+        # ⭐️ 這是 SQLAlchemy 2.0 的查詢語法
+        # SELECT * FROM chat_history WHERE line_user_id=? ORDER BY timestamp DESC LIMIT ?
+        stmt = (
+            db.select(ChatHistory)
+            .filter_by(line_user_id=user_id)
+            .order_by(ChatHistory.timestamp.desc())
+            .limit(limit)
+        )
+        # .all() 會回傳一個 ChatHistory 物件的 list
+        rows = db.session.scalars(stmt).all()
+        
+        history = [(row.role, row.content) for row in rows]
+        return list(reversed(history)) # 保持你原本的 (反轉) 邏輯
+        
     except Exception as e:
         app.logger.error(f"Error getting chat history for user {user_id}: {e}")
         return []
 
-# ⭐️ ---- 2.1 ⭐️ 新增：地區設定相關函式 ----
+# ---- 2.2 ⭐️ 地區設定相關函式 (使用 SQLAlchemy) ----
 
-# (你的 CITY_ALIASES 和 normalize_city 函式移到這裡，因為多處需要)
+# (CITY_ALIASES 和 normalize_city 函式不變，因為它們與資料庫無關)
 CITY_ALIASES = {
     "台北": "臺北市", "臺北": "臺北市", "北市": "臺北市","臺北市":"臺北市", "台北市":"臺北市",
     "新北": "新北市", "新北市":"新北市",
@@ -228,72 +241,72 @@ CITY_ALIASES = {
 }
 
 def normalize_city(text: str) -> str:
-    """
-    正規化城市名稱，並檢查是否存在於別名列表中
-    """
     text = (text or "").strip()
     if not text:
-        return "臺北市" # 保留預設
-    
+        return "臺北市"
     normalized = CITY_ALIASES.get(text)
     if normalized:
         return normalized
-    
-    # 如果不在別名中，檢查是否為標準名稱 (例如 "臺北市")
     if text in CITY_ALIASES.values():
         return text
-        
-    return None # 回傳 None 代表查無此地
+    return None
 
 def save_user_home_city(user_id: str, city_name: str) -> str:
     """
-    儲存或更新使用者的「預設地區」
+    儲存或更新使用者的「預設地區」 (使用 SQLAlchemy)
     """
     if not user_id:
         return "無法識別使用者 ID。"
     
-    # 驗證地區
     normalized_city = normalize_city(city_name)
     if not normalized_city:
         return f"抱歉，我不認識「{city_name}」。我目前只支援臺灣的縣市。"
     
     try:
-        with sqlite3.connect(DB_NAME) as conn:
-            cursor = conn.cursor()
-            # ⭐️ 把正規化後的城市存入 home_city 欄位
-            cursor.execute("""
-                INSERT INTO users (line_user_id, home_city, last_updated)
-                VALUES (?, ?, ?)
-                ON CONFLICT(line_user_id) DO UPDATE SET
-                    home_city = excluded.home_city,
-                    last_updated = excluded.last_updated
-            """, (user_id, normalized_city, datetime.datetime.now()))
-            conn.commit()
+        user = db.session.get(User, user_id)
+        
+        if not user:
+            # ⭐️ 建立新使用者，並設定 home_city
+            user = User(
+                line_user_id=user_id, 
+                home_city=normalized_city, 
+                last_updated=datetime.datetime.now()
+            )
+            db.session.add(user)
+        else:
+            # ⭐️ 更新現有使用者的 home_city
+            user.home_city = normalized_city
+            user.last_updated = datetime.datetime.now()
+            
+        db.session.commit() # ⭐️ 儲存
+        
         app.logger.info(f"Saved home city for user {user_id}: {normalized_city}")
         return f"您的預設地區已設定為：「{normalized_city}」"
+        
     except Exception as e:
+        db.session.rollback()
         app.logger.error(f"Error saving home city for user {user_id}: {e}")
         return "抱歉，儲存地區時發生錯誤。"
 
 def get_user_home_city(user_id: str) -> str:
     """
-    從資料庫讀取使用者的「預設地區」，若無則回傳 '臺北市'
+    從資料庫讀取使用者的「預設地區」 (使用 SQLAlchemy)
     """
     if not user_id:
         return "臺北市" # 預設
     try:
-        with sqlite3.connect(DB_NAME) as conn:
-            cursor = conn.cursor()
-            cursor.execute("SELECT home_city FROM users WHERE line_user_id = ?", (user_id,))
-            row = cursor.fetchone()
-            # ⭐️ 如果 row[0] (home_city) 有值，就回傳；否則回傳預設
-            return row[0] if row and row[0] else "臺北市"
+        user = db.session.get(User, user_id)
+        
+        # ⭐️ 如果 user 存在且 home_city 有值
+        return user.home_city if user and user.home_city else "臺北市"
+        
     except Exception as e:
         app.logger.error(f"Error getting home city for user {user_id}: {e}")
         return "臺北市" # 發生錯誤時也回傳預設
 
 
 # ---- 3. 既有的天氣功能 (CWA API) ----
+# (此區塊完全不變，因為它不碰資料庫)
 def get_weather_36h(location="臺北市") -> dict:
     if not CWA_API_KEY:
         return {"error": "尚未設定 CWA_API_KEY..."}
@@ -303,7 +316,6 @@ def get_weather_36h(location="臺北市") -> dict:
     s = requests.Session()
     s.trust_env = False
     
-    # (SSL 驗證邏輯...)
     force_insecure = bool(os.getenv("CWA_INSECURE"))
     attempts = []
     if force_insecure:
@@ -319,7 +331,6 @@ def get_weather_36h(location="臺北市") -> dict:
             data = r.json()
             locs = data.get("records", {}).get("location", [])
             if not locs:
-                # ⭐️ 如果 API 查不到 (例如 normalize_city 漏了)，給出明確錯誤
                 return {"error": f"查不到「{location}」的天氣資訊，請確認是否為臺灣的縣市。"}
             
             loc = locs[0]
@@ -353,6 +364,7 @@ def get_weather_36h(location="臺北市") -> dict:
 
 
 # ---- 4. AI 穿搭建議功能 ----
+# (此區塊完全不變，因為它呼叫的是 2.1 區塊的函式)
 def get_clothing_advice(user_id: str, location: str) -> str:
     if not gemini_model:
         return "抱歉，AI 建議功能目前無法使用 (Gemini 未啟動)。"
@@ -365,10 +377,10 @@ def get_clothing_advice(user_id: str, location: str) -> str:
         if "error" in weather_data:
             return f"抱歉，我拿不到「{location}」的天氣資訊，無法給您建議。"
 
-        # 2. 撈偏好 (SQLite)
+        # 2. 撈偏好 (⭐️ 已更新為 SQLAlchemy 版本)
         user_prefs = get_user_preference(user_id)
 
-        # 3. 撈聊天紀錄 (SQLite)
+        # 3. 撈聊天紀錄 (⭐️ 已更新為 SQLAlchemy 版本)
         history_rows = get_chat_history(user_id, limit=10)
 
         # 4. 組合 Prompt (指令) 送給 AI
@@ -391,7 +403,7 @@ def get_clothing_advice(user_id: str, location: str) -> str:
         else:
             prompt_parts.append("尚無聊天紀錄")
             
-        prompt_parts.append("\n--- 你的建議 ---")
+        prompt_parts.append("\n--- Suggere-me ---")
         prompt_parts.append(f"請根據 {weather_data['location']} 的天氣({weather_data['minT']}~{weather_data['maxT']}度，{weather_data['wx']})，以及使用者的偏好和聊天紀錄，直接開始提供建議：")
 
         final_prompt = "\n".join(prompt_parts)
@@ -405,6 +417,7 @@ def get_clothing_advice(user_id: str, location: str) -> str:
 
 
 # ---- 5. Flask Webhook 路由 ----
+# (此區塊完全不變，因為它呼叫的是 2.1 區塊的函式)
 
 @app.get("/health")
 def health():
@@ -413,7 +426,7 @@ def health():
 @app.route("/webhook", methods=['POST'])
 def webhook():
     signature = request.headers.get('X-Line-Signature', '')
-    body = request.get_data(as_text=True) or "" # 修正了之前的 as_text.True 錯誤
+    body = request.get_data(as_text=True) or "" 
 
     if not signature or not body.strip():
         return "OK"
@@ -439,23 +452,22 @@ def webhook():
                 if not user_id:
                     continue 
 
+                # ⭐️ 呼叫 SQLAlchemy 版本的 add_chat_history
                 add_chat_history(user_id, "user", text)
                 reply = "" 
 
                 # ⭐️⭐️ 關鍵：新的指令路由 ⭐️⭐️
                 
                 if text.startswith("天氣"):
-                    # 1. 天氣功能
                     city_text = text.replace("天氣", "", 1).strip()
                     city_norm = ""
                     reply_prefix = ""
                     
                     if not city_text:
-                        # ⭐️ 如果只打「天氣」，使用預設地區
+                        # ⭐️ 呼叫 SQLAlchemy 版本的 get_user_home_city
                         city_norm = get_user_home_city(user_id)
-                        reply_prefix = f"（您設定的地區：{city_norm}）\n\n" # 加上提示
+                        reply_prefix = f"（您設定的地區：{city_norm}）\n\n"
                     else:
-                        # ⭐️ 否則，使用指定的地區
                         city_norm = normalize_city(city_text)
                     
                     if not city_norm:
@@ -468,38 +480,37 @@ def webhook():
                             reply = reply_prefix + weather_data["full_text"]
 
                 elif text.startswith("記住我"):
-                    # 2. 儲存偏好
                     prefs = text.replace("記住我", "", 1).strip()
                     if not prefs:
                         reply = "請告訴我你的喜好，例如：「記住我 穿搭偏好：喜歡穿短褲」"
                     else:
-                        # ⭐️ 呼叫更新後的 "附加" 函式
+                        # ⭐️ 呼叫 SQLAlchemy 版本的 save_user_preference
                         reply = save_user_preference(user_id, prefs)
                 
                 elif text == "我的偏好":
-                    # 3. ⭐️ 新增：查看偏好
+                    # ⭐️ 呼叫 SQLAlchemy 版本的 get_user_preference
                     prefs = get_user_preference(user_id)
                     reply = f"您目前的偏好設定：\n\n{prefs}"
 
                 elif text == "忘記我":
-                    # 4. ⭐️ 新增：清除偏好
+                    # ⭐️ 呼叫 SQLAlchemy 版本的 clear_user_preference
                     reply = clear_user_preference(user_id)
 
                 elif text.startswith("設定地區"):
-                    # 5. 設定地區
                     city_text = text.replace("設定地區", "", 1).strip()
                     if not city_text:
                         reply = "請輸入地區，例如：「設定地區 新北市」"
                     else:
+                        # ⭐️ 呼叫 SQLAlchemy 版本的 save_user_home_city
                         reply = save_user_home_city(user_id, city_text)
 
                 elif text == "今天穿什麼" or text == "穿搭建議" or text == "給我穿搭建議":
-                    # 6. AI 穿搭建議
+                    # ⭐️ 呼叫 SQLAlchemy 版本的 get_user_home_city
                     city = get_user_home_city(user_id)
+                    # ⭐️ 呼叫 SQLAlchemy 版本的 get_clothing_advice
                     reply = get_clothing_advice(user_id, city)
 
                 else:
-                    # 7. 預設回覆 (⭐️ 更新提示文字)
                     reply = (
                         f"Hello 👋 你說：{text}\n\n"
                         f"我現在支援：\n"
@@ -512,6 +523,7 @@ def webhook():
                     )
                 
                 if reply:
+                    # ⭐️ 呼叫 SQLAlchemy 版本的 add_chat_history
                     add_chat_history(user_id, "bot", reply)
                 else:
                     reply = "抱歉，我不知道怎麼回應。"
@@ -524,8 +536,21 @@ def webhook():
                 )
     return "OK"
 
+# ⭐️ ---- 6. ⭐️ 新增：建立資料表的函式 ----
+def create_all_tables():
+    """
+    使用 SQLAlchemy 建立所有資料表 (如果不存在)
+    這會取代你舊的 init_db()
+    """
+    try:
+        # ⭐️ 必須在 app context 中執行
+        with app.app_context():
+            db.create_all()
+        app.logger.info("SQLAlchemy tables created successfully (if they didn't exist).")
+    except Exception as e:
+        app.logger.error(f"Error creating SQLAlchemy tables: {e}")
 
 if __name__ == "__main__":
-    init_db() # ⭐️ 啟動時呼叫 (會自動更新資料表)
+    create_all_tables() # ⭐️ 啟動時呼叫 (會自動更新資料表)
     port = int(os.getenv("PORT", 3000))
     app.run(host="0.0.0.0", port=port, debug=False)

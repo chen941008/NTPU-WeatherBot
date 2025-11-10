@@ -5,3 +5,5 @@ python-dotenv
 requests
 certifi
 google-generativeai
+psycopg2-binary
+Flask-SQLAlchemy
