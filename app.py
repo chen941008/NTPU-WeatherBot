@@ -17,7 +17,7 @@ from linebot.v3.webhook import WebhookParser
 from linebot.v3.messaging import (
     Configuration, ApiClient, MessagingApi,
     ReplyMessageRequest, TextMessage,
-    QuickReply, QuickReplyButton, MessageAction
+    QuickReply, QuickReplyItem, MessageAction
 )
 
 load_dotenv()
@@ -527,13 +527,13 @@ def webhook():
                 # ⭐️ 1. 建立「快速回覆」按鈕
                 qr_buttons = QuickReply(
                     items=[
-                        QuickReplyButton(
+                        QuickReplyItem(
                             action=MessageAction(label="☀️ 看天氣", text="天氣")
                         ),
-                        QuickReplyButton(
+                        QuickReplyItem(
                             action=MessageAction(label="👕 穿搭建議", text="今天穿什麼")
                         ),
-                        QuickReplyButton(
+                        QuickReplyItem(
                             action=MessageAction(label="❤️ 我的偏好", text="我的偏好")
                         ),
                     ]
