@@ -25,8 +25,8 @@ app = Flask(__name__)
 
 # ---- 1. 金鑰與設定 ----
 CHANNEL_SECRET = os.getenv("LINE_CHANNEL_SECRET")
-CHANNEL_TOKEN  = os.getenv("LINE_CHANNEL_ACCESS_TOKEN")
-CWA_API_KEY    = os.getenv("CWA_API_KEY")
+CHANNEL_TOKEN = os.getenv("LINE_CHANNEL_ACCESS_TOKEN")
+CWA_API_KEY = os.getenv("CWA_API_KEY")
 GOOGLE_API_KEY = os.getenv("GOOGLE_API_KEY")
 # DB_NAME = "bot.db" # ⭐️ 移除：不再需要
 
@@ -346,10 +346,10 @@ def get_weather_36h(location="臺北市") -> dict:
                 return {"error": f"查不到「{location}」的天氣資訊，請確認是否為臺灣的縣市。"}
             
             loc = locs[0]
-            wx   = loc["weatherElement"][0]["time"][0]["parameter"]["parameterName"]
-            pop  = loc["weatherElement"][1]["time"][0]["parameter"]["parameterName"]
+            wx  = loc["weatherElement"][0]["time"][0]["parameter"]["parameterName"]
+            pop = loc["weatherElement"][1]["time"][0]["parameter"]["parameterName"]
             minT = loc["weatherElement"][2]["time"][0]["parameter"]["parameterName"]
-            ci   = loc["weatherElement"][3]["time"][0]["parameter"]["parameterName"]
+            ci  = loc["weatherElement"][3]["time"][0]["parameter"]["parameterName"]
             maxT = loc["weatherElement"][4]["time"][0]["parameter"]["parameterName"]
             
             return {
