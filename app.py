@@ -17,6 +17,7 @@ from linebot.v3.webhook import WebhookParser
 from linebot.v3.messaging import (
     Configuration, ApiClient, MessagingApi,
     ReplyMessageRequest, TextMessage,
+    QuickReply, QuickReplyButton, MessageAction
 )
 
 load_dotenv()
@@ -521,30 +522,65 @@ def webhook():
                     # ⭐️ 呼叫 SQLAlchemy 版本的 get_clothing_advice
                     reply = get_clothing_advice(user_id, city)
 
-                else:
-                    reply = (
-                        f"Hello 👋 你說：{text}\n\n"
-                        f"這是我目前會的功能：\n"
-                        f"・天氣 (預設/指定地區)\n"
-                        f"・今天穿什麼 (AI穿搭建議)\n"
-                        f"・設定地區 [你的縣市]\n"
-                        f"・記住我 [你的偏好] (可多次新增)\n"
-                        f"・我的偏好 (查看)\n"
-                        f"・忘記我 (清除偏好)"
-                    )
-                
-                if reply:
-                    # ⭐️ 呼叫 SQLAlchemy 版本的 add_chat_history
-                    add_chat_history(user_id, "bot", reply)
-                else:
-                    reply = "抱歉，我不知道怎麼回應。"
+                # (請貼上這段新程式碼)
+            else:
+                # ⭐️ 1. 建立「快速回覆」按鈕
+                qr_buttons = QuickReply(
+                    items=[
+                        QuickReplyButton(
+                            action=MessageAction(label="☀️ 看天氣", text="天氣")
+                        ),
+                        QuickReplyButton(
+                            action=MessageAction(label="👕 穿搭建議", text="今天穿什麼")
+                        ),
+                        QuickReplyButton(
+                            action=MessageAction(label="❤️ 我的偏好", text="我的偏好")
+                        ),
+                    ]
+                )
 
+                # ⭐️ 2. 準備回覆的文字
+                reply_text = f"哈囉！你說了：{text}\n\n需要我幫你做什麼嗎？"
+
+                # ⭐️ 3. 建立帶有按鈕的 TextMessage
+                reply_msg_obj = TextMessage(
+                    text=reply_text,
+                    quick_reply=qr_buttons  # 關鍵！把按鈕加進來
+                )
+
+                # ⭐️ 4. 儲存這筆 bot 的回覆到聊天紀錄
+                add_chat_history(user_id, "bot", reply_text)
+
+                # ⭐️ 5. 馬上回覆訊息 (包含按鈕)
                 line_bot_api.reply_message(
                     ReplyMessageRequest(
                         reply_token=reply_token,
-                        messages=[TextMessage(text=reply)]
+                        messages=[reply_msg_obj] # 傳送我們剛建立的「帶按鈕的訊息」
                     )
                 )
+
+                # ⭐️ 6. (重要) 因為我們已經手動回覆了，
+                # 我們要用 `continue` 來跳過這個 event，
+                # 避免程式跑到後面又試圖回覆一次
+                continue
+
+            # (注意！下面的 "if reply:" 和 "line_bot_api.reply_message(...)" 區塊
+            #  會因為 continue 而被「跳過」，這是我們故意的，
+            #  因為我們只希望 "天氣"、"我的偏好" 等指令走那邊的邏輯)
+
+            # (請確認你「沒有」動到下面這些 if reply: 的程式碼)
+            if reply:
+                # ⭐️ 呼叫 SQLAlchemy 版本的 add_chat_history
+                add_chat_history(user_id, "bot", reply)
+            else:
+                reply = "抱歉，我不知道怎麼回應。"
+
+            line_bot_api.reply_message(
+                ReplyMessageRequest(
+                    reply_token=reply_token,
+                    messages=[TextMessage(text=reply)]
+                )
+            )
     return "OK"
 
 
