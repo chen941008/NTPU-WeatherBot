@@ -1,7 +1,7 @@
 import os
 import requests
 import certifi
-# import sqlite3  # ⭐️ 移除：不再使用 sqlite3
+# import sqlite3  # ⭐️ 移除：不再使用 sqlite3
 import datetime
 from flask import Flask, request
 from dotenv import load_dotenv
@@ -17,6 +17,7 @@ from linebot.v3.webhook import WebhookParser
 from linebot.v3.messaging import (
     Configuration, ApiClient, MessagingApi,
     ReplyMessageRequest, TextMessage,
+    QuickReply, QuickReplyItem, MessageAction  # ✅ 修正：使用 QuickReplyItem
 )
 
 load_dotenv()
@@ -24,8 +25,8 @@ app = Flask(__name__)
 
 # ---- 1. 金鑰與設定 ----
 CHANNEL_SECRET = os.getenv("LINE_CHANNEL_SECRET")
-CHANNEL_TOKEN  = os.getenv("LINE_CHANNEL_ACCESS_TOKEN")
-CWA_API_KEY    = os.getenv("CWA_API_KEY")
+CHANNEL_TOKEN  = os.getenv("LINE_CHANNEL_ACCESS_TOKEN")
+CWA_API_KEY    = os.getenv("CWA_API_KEY")
 GOOGLE_API_KEY = os.getenv("GOOGLE_API_KEY")
 # DB_NAME = "bot.db" # ⭐️ 移除：不再需要
 
@@ -345,19 +346,19 @@ def get_weather_36h(location="臺北市") -> dict:
                 return {"error": f"查不到「{location}」的天氣資訊，請確認是否為臺灣的縣市。"}
             
             loc = locs[0]
-            wx   = loc["weatherElement"][0]["time"][0]["parameter"]["parameterName"]
-            pop  = loc["weatherElement"][1]["time"][0]["parameter"]["parameterName"]
+            wx   = loc["weatherElement"][0]["time"][0]["parameter"]["parameterName"]
+            pop  = loc["weatherElement"][1]["time"][0]["parameter"]["parameterName"]
             minT = loc["weatherElement"][2]["time"][0]["parameter"]["parameterName"]
-            ci   = loc["weatherElement"][3]["time"][0]["parameter"]["parameterName"]
+            ci   = loc["weatherElement"][3]["time"][0]["parameter"]["parameterName"]
             maxT = loc["weatherElement"][4]["time"][0]["parameter"]["parameterName"]
             
             return {
                 "location": location, "wx": wx, "pop": pop, "minT": minT, "maxT": maxT, "ci": ci,
                 "full_text": (f"{location} 今明短期預報：\n"
-                              f"・天氣：{wx}\n"
-                              f"・降雨機率：{pop}%\n"
-                              f"・溫度：{minT}°C ~ {maxT}°C\n"
-                              f"・體感/舒適度：{ci}")
+                                f"・天氣：{wx}\n"
+                                f"・降雨機率：{pop}%\n"
+                                f"・溫度：{minT}°C ~ {maxT}°C\n"
+                                f"・體感/舒適度：{ci}")
             }
         except requests.exceptions.SSLError as e:
             app.logger.warning(f"CWA SSL verify failed (verify={do_verify}). err={e}")
@@ -367,7 +368,7 @@ def get_weather_36h(location="臺北市") -> dict:
             app.logger.error(f"CWA request error: {e}")
             return {"error": "氣象資料連線失敗，稍後再試。"}
         except Exception as e:
-            app.logger.error(f"CWA parse error: {e}")
+            app.logger.error(f"CWAs parse error: {e}")
             return {"error": "天氣資料解析失敗，稍後再試。"}
 
     app.logger.error(f"CWA SSL still failing after fallback: {last_err}")
@@ -428,7 +429,6 @@ def get_clothing_advice(user_id: str, location: str) -> str:
 
 
 # ---- 5. Flask Webhook 路由 ----
-# (此區塊完全不變，因為它呼叫的是 2.1 區塊的函式)
 
 @app.get("/health")
 def health():
@@ -521,22 +521,55 @@ def webhook():
                     # ⭐️ 呼叫 SQLAlchemy 版本的 get_clothing_advice
                     reply = get_clothing_advice(user_id, city)
 
+                # ✅✅✅ --- 這是「最終修正版」的 else 區塊 --- ✅✅✅
                 else:
-                    reply = (
-                        f"Hello 👋 你說：{text}\n\n"
-                        f"我現在支援：\n"
-                        f"・天氣 (預設/指定地區)\n"
-                        f"・今天穿什麼 (AI穿搭建議)\n"
-                        f"・設定地區 [你的縣市]\n"
-                        f"・記住我 [你的偏好] (可多次新增)\n"
-                        f"・我的偏好 (查看)\n"
-                        f"・忘記我 (清除偏好)"
+                    # ⭐️ 1. 建立「快速回覆」按鈕
+                    qr_buttons = QuickReply(
+                        items=[
+                            QuickReplyItem(  # ✅ 修正：使用 QuickReplyItem
+                                action=MessageAction(label="☀️ 看天氣", text="天氣")
+                            ),
+                            QuickReplyItem(  # ✅ 修正：使用 QuickReplyItem
+                                action=MessageAction(label="👕 穿搭建議", text="今天穿什麼")
+                            ),
+                            QuickReplyItem(  # ✅ 修正：使用 QuickReplyItem
+                                action=MessageAction(label="❤️ 我的偏好", text="我的偏好")
+                            ),
+                        ]
                     )
+
+                    # ⭐️ 2. 準備回覆的文字
+                    reply_text = f"哈囉！你說了：{text}\n\n需要我幫你做什麼嗎？"
+                    
+                    # ⭐️ 3. 建立帶有按鈕的 TextMessage
+                    reply_msg_obj = TextMessage(
+                        text=reply_text,
+                        quick_reply=qr_buttons  # 關鍵！把按鈕加進來
+                    )
+                    
+                    # ⭐️ 4. 儲存這筆 bot 的回覆到聊天紀錄
+                    add_chat_history(user_id, "bot", reply_text)
+                    
+                    # ⭐️ 5. 馬上回覆訊息 (包含按鈕)
+                    line_bot_api.reply_message(
+                        ReplyMessageRequest(
+                            reply_token=reply_token,
+                            messages=[reply_msg_obj] # 傳送我們剛建立的「帶按鈕的訊息」
+                        )
+                    )
+                    
+                    # ⭐️ 6. (重要) 因為我們已經手動回覆了，
+                    # 我們要用 `continue` 來跳過這個 event，
+                    # 避免程式跑到後面又試圖回覆一次
+                    continue
                 
+                # ✅✅✅ --- 這是「舊的、有問題的」邏輯 --- ✅✅✅
+                # (但它會被上面的 continue 跳過，所以不會再出錯)
                 if reply:
                     # ⭐️ 呼叫 SQLAlchemy 版本的 add_chat_history
                     add_chat_history(user_id, "bot", reply)
                 else:
+                    # ❌ (這就是你 1:28 AM 看到的 bug 發生點)
                     reply = "抱歉，我不知道怎麼回應。"
 
                 line_bot_api.reply_message(
