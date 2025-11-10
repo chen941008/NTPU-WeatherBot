@@ -4,3 +4,4 @@ line-bot-sdk==3.*
 python-dotenv
 requests
 certifi
+google-generativeai
