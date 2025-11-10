@@ -85,6 +85,17 @@ class ChatHistory(db.Model):
     timestamp = db.Column(db.DateTime, default=datetime.datetime.now)
 
 
+# ⭐️⭐️⭐️ ↓↓ 終極修正：Gunicorn 啟動時自動建立資料表 ↓↓ ⭐️⭐️⭐️
+# 這樣 Gunicorn 啟動時就會執行，解決 'UndefinedTable' 錯誤
+try:
+    with app.app_context():
+        db.create_all()
+    app.logger.info("SQLAlchemy tables checked/created successfully.")
+except Exception as e:
+    app.logger.error(f"Error creating SQLAlchemy tables on startup: {e}")
+# ⭐️⭐️⭐️ ↑↑ 終極修正 ↑↑ ⭐️⭐️⭐️
+
+
 # ⭐️ ---- 2.1 ⭐️ 資料庫 (SQLAlchemy) 相關功能 ----
 # 所有的函式都重寫了，不再使用 sqlite3
 
@@ -403,7 +414,7 @@ def get_clothing_advice(user_id: str, location: str) -> str:
         else:
             prompt_parts.append("尚無聊天紀錄")
             
-        prompt_parts.append("\n--- Suggere-me ---")
+        prompt_parts.append("\n--- Suggere-me ---") # (你這裡拼錯了，但我先保留，以免影響你的 prompt)
         prompt_parts.append(f"請根據 {weather_data['location']} 的天氣({weather_data['minT']}~{weather_data['maxT']}度，{weather_data['wx']})，以及使用者的偏好和聊天紀錄，直接開始提供建議：")
 
         final_prompt = "\n".join(prompt_parts)
@@ -536,21 +547,12 @@ def webhook():
                 )
     return "OK"
 
-# ⭐️ ---- 6. ⭐️ 新增：建立資料表的函式 ----
-def create_all_tables():
-    """
-    使用 SQLAlchemy 建立所有資料表 (如果不存在)
-    這會取代你舊的 init_db()
-    """
-    try:
-        # ⭐️ 必須在 app context 中執行
-        with app.app_context():
-            db.create_all()
-        app.logger.info("SQLAlchemy tables created successfully (if they didn't exist).")
-    except Exception as e:
-        app.logger.error(f"Error creating SQLAlchemy tables: {e}")
+
+# ⭐️ ---- 6. ⭐️ 移除多餘的函式 ----
+# def create_all_tables(): ... 
+# ⭐️ (已移除，功能移到檔案頂部)
 
 if __name__ == "__main__":
-    create_all_tables() # ⭐️ 啟動時呼叫 (會自動更新資料表)
+    # ⭐️ (本地測試時，頂部的 db.create_all() 也會自動執行)
     port = int(os.getenv("PORT", 3000))
     app.run(host="0.0.0.0", port=port, debug=False)
