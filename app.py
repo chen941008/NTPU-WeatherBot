@@ -1,7 +1,7 @@
 import os
 import requests
 import certifi
-# import sqlite3  # ⭐️ 移除：不再使用 sqlite3
+# import sqlite3  # ⭐️ 移除：不再使用 sqlite3
 import datetime
 from flask import Flask, request
 from dotenv import load_dotenv
@@ -17,7 +17,7 @@ from linebot.v3.webhook import WebhookParser
 from linebot.v3.messaging import (
     Configuration, ApiClient, MessagingApi,
     ReplyMessageRequest, TextMessage,
-    QuickReply, QuickReplyItem, MessageAction  # ✅ 修正：使用 QuickReplyItem
+    QuickReply, QuickReplyItem, MessageAction
 )
 
 load_dotenv()
@@ -25,22 +25,17 @@ app = Flask(__name__)
 
 # ---- 1. 金鑰與設定 ----
 CHANNEL_SECRET = os.getenv("LINE_CHANNEL_SECRET")
-CHANNEL_TOKEN = os.getenv("LINE_CHANNEL_ACCESS_TOKEN")
-CWA_API_KEY = os.getenv("CWA_API_KEY")
+CHANNEL_TOKEN  = os.getenv("LINE_CHANNEL_ACCESS_TOKEN")
+CWA_API_KEY    = os.getenv("CWA_API_KEY")
 GOOGLE_API_KEY = os.getenv("GOOGLE_API_KEY")
-# DB_NAME = "bot.db" # ⭐️ 移除：不再需要
 
 # ⭐️ ---- 1.1 ⭐️ 新增：SQLAlchemy 資料庫設定 ----
-# 這會自動讀取你在 Render 上設定的 DATABASE_URL 環境變數
 database_url = os.environ.get('DATABASE_URL')
 if database_url and database_url.startswith("postgres://"):
-    # Render 的 URL 是 'postgres://' 開頭，SQLAlchemy 1.4+ 需要 'postgresql://'
     database_url = database_url.replace("postgres://", "postgresql://", 1)
 
-# 如果在本地執行 (沒有 DATABASE_URL)，則使用一個本地的 sqlite 檔案 (方便測試)
 if not database_url:
     app.logger.warning("DATABASE_URL not set, using local sqlite.db for development.")
-    # 注意：本地測試用的檔案會叫做 local_bot.db
     database_url = "sqlite:///local_bot.db"
 
 app.config['SQLALCHEMY_DATABASE_URI'] = database_url
@@ -67,7 +62,6 @@ else:
 
 
 # ⭐️ ---- 2. ⭐️ 新增：SQLAlchemy 資料庫模型 (Models) ----
-# 這會取代你原本的 CREATE TABLE
 class User(db.Model):
     __tablename__ = 'users'
     # 欄位定義
@@ -75,30 +69,30 @@ class User(db.Model):
     preferences = db.Column(db.Text, nullable=True)
     last_updated = db.Column(db.DateTime, onupdate=datetime.datetime.now)
     home_city = db.Column(db.String, nullable=True)
+    session_state = db.Column(db.String, nullable=True, default=None) # ✅ 升級：新增「狀態」欄位
 
 class ChatHistory(db.Model):
     __tablename__ = 'chat_history'
     # 欄位定義
     message_id = db.Column(db.Integer, primary_key=True, autoincrement=True)
-    line_user_id = db.Column(db.String, index=True) # ⭐️ 加上 index 查詢會更快
+    line_user_id = db.Column(db.String, index=True)
     role = db.Column(db.String)
     content = db.Column(db.Text)
     timestamp = db.Column(db.DateTime, default=datetime.datetime.now)
 
 
-# ⭐️⭐️⭐️ ↓↓ 終極修正：Gunicorn 啟動時自動建立資料表 ↓↓ ⭐️⭐️⭐️
-# 這樣 Gunicorn 啟動時就會執行，解決 'UndefinedTable' 錯誤
+# ⭐️⭐️⭐️ 啟動時自動建立資料表 ⭐️⭐️⭐️
 try:
     with app.app_context():
         db.create_all()
     app.logger.info("SQLAlchemy tables checked/created successfully.")
 except Exception as e:
     app.logger.error(f"Error creating SQLAlchemy tables on startup: {e}")
-# ⭐️⭐️⭐️ ↑↑ 終極修正 ↑↑ ⭐️⭐️⭐️
+# ⭐️⭐️⭐️⭐️⭐️⭐️⭐️⭐️⭐️⭐️⭐️⭐️⭐️⭐️
 
 
 # ⭐️ ---- 2.1 ⭐️ 資料庫 (SQLAlchemy) 相關功能 ----
-# 所有的函式都重寫了，不再使用 sqlite3
+# (此區塊完全不變)
 
 def save_user_preference(user_id: str, new_pref: str) -> str:
     """
@@ -107,38 +101,34 @@ def save_user_preference(user_id: str, new_pref: str) -> str:
     if not user_id: return "無法識別使用者 ID。"
     
     try:
-        # 1. 先取得使用者物件 (如果不存在，等等會建立)
-        # ⭐️ db.session.get() 是 SQLAlchemy 取代 SELECT ... WHERE id=? 的方法
         user = db.session.get(User, user_id)
         
         final_prefs = ""
         if not user:
-            # ⭐️ 如果使用者不存在，建立一個新的
             final_prefs = new_pref
             user = User(
                 line_user_id=user_id, 
                 preferences=final_prefs, 
                 last_updated=datetime.datetime.now()
             )
-            db.session.add(user) # ⭐️ 加入到 session 準備新增
+            db.session.add(user)
         else:
-            # ⭐️ 如果使用者存在，附加偏好
             current_prefs = user.preferences
             if not current_prefs:
                 final_prefs = new_pref
             else:
                 final_prefs = current_prefs + "\n" + new_pref
             
-            user.preferences = final_prefs # ⭐️ 更新物件
+            user.preferences = final_prefs
             user.last_updated = datetime.datetime.now()
             
-        db.session.commit() # ⭐️ 執行資料庫交易
+        db.session.commit()
         
         app.logger.info(f"Appended preference for user {user_id}")
         return f"我記住了：「{new_pref}」\n\n（點選「我的偏好」查看全部）"
         
     except Exception as e:
-        db.session.rollback() # ⭐️ 發生錯誤時回滾
+        db.session.rollback()
         app.logger.error(f"Error saving preference for user {user_id}: {e}")
         return "抱歉，儲存喜好時發生錯誤。"
 
@@ -148,12 +138,8 @@ def get_user_preference(user_id: str) -> str:
     """
     if not user_id: return ""
     try:
-        # ⭐️ 透過 Primary Key (user_id) 取得使用者
         user = db.session.get(User, user_id)
-        
-        # ⭐️ 如果 user 存在且 preferences 有值
         return user.preferences if user and user.preferences else "尚未設定"
-        
     except Exception as e:
         app.logger.error(f"Error getting preference for user {user_id}: {e}")
         return "讀取偏好時發生錯誤"
@@ -168,15 +154,15 @@ def clear_user_preference(user_id: str) -> str:
         user = db.session.get(User, user_id)
         
         if user:
-            user.preferences = None # ⭐️ 設為 None (即資料庫中的 NULL)
+            user.preferences = None
             user.last_updated = datetime.datetime.now()
-            db.session.commit() # ⭐️ 儲存變更
+            db.session.commit()
             
         app.logger.info(f"Cleared preferences for user {user_id}")
         return "我已經忘記你所有的偏好了。"
         
     except Exception as e:
-        db.session.rollback() # ⭐️ 回滾
+        db.session.rollback()
         app.logger.error(f"Error clearing preference for user {user_id}: {e}")
         return "抱歉，清除偏好時發生錯誤。"
 
@@ -186,15 +172,14 @@ def add_chat_history(user_id: str, role: str, content: str):
     """
     if not user_id or not content: return
     try:
-        # ⭐️ 建立一個新的 ChatHistory 物件
         new_chat = ChatHistory(
             line_user_id=user_id,
             role=role,
             content=content,
             timestamp=datetime.datetime.now()
         )
-        db.session.add(new_chat) # ⭐️ 加入
-        db.session.commit() # ⭐️ 儲存
+        db.session.add(new_chat)
+        db.session.commit()
         
     except Exception as e:
         db.session.rollback()
@@ -206,27 +191,23 @@ def get_chat_history(user_id: str, limit: int = 10) -> list:
     """
     if not user_id: return []
     try:
-        # ⭐️ 這是 SQLAlchemy 2.0 的查詢語法
-        # SELECT * FROM chat_history WHERE line_user_id=? ORDER BY timestamp DESC LIMIT ?
         stmt = (
             db.select(ChatHistory)
             .filter_by(line_user_id=user_id)
             .order_by(ChatHistory.timestamp.desc())
             .limit(limit)
         )
-        # .all() 會回傳一個 ChatHistory 物件的 list
         rows = db.session.scalars(stmt).all()
         
         history = [(row.role, row.content) for row in rows]
-        return list(reversed(history)) # 保持你原本的 (反轉) 邏輯
+        return list(reversed(history))
         
     except Exception as e:
         app.logger.error(f"Error getting chat history for user {user_id}: {e}")
         return []
 
 # ---- 2.2 ⭐️ 地區設定相關函式 (使用 SQLAlchemy) ----
-
-# (CITY_ALIASES 和 normalize_city 函式不變，因為它們與資料庫無關)
+# (此區塊完全不變)
 CITY_ALIASES = {
     "台北": "臺北市", "臺北": "臺北市", "北市": "臺北市","臺北市":"臺北市", "台北市":"臺北市",
     "新北": "新北市", "新北市":"新北市",
@@ -278,7 +259,6 @@ def save_user_home_city(user_id: str, city_name: str) -> str:
         user = db.session.get(User, user_id)
         
         if not user:
-            # ⭐️ 建立新使用者，並設定 home_city
             user = User(
                 line_user_id=user_id, 
                 home_city=normalized_city, 
@@ -286,11 +266,10 @@ def save_user_home_city(user_id: str, city_name: str) -> str:
             )
             db.session.add(user)
         else:
-            # ⭐️ 更新現有使用者的 home_city
             user.home_city = normalized_city
             user.last_updated = datetime.datetime.now()
             
-        db.session.commit() # ⭐️ 儲存
+        db.session.commit()
         
         app.logger.info(f"Saved home city for user {user_id}: {normalized_city}")
         return f"您的預設地區已設定為：「{normalized_city}」"
@@ -308,17 +287,14 @@ def get_user_home_city(user_id: str) -> str:
         return "臺北市" # 預設
     try:
         user = db.session.get(User, user_id)
-        
-        # ⭐️ 如果 user 存在且 home_city 有值
         return user.home_city if user and user.home_city else "臺北市"
-        
     except Exception as e:
         app.logger.error(f"Error getting home city for user {user_id}: {e}")
-        return "臺北市" # 發生錯誤時也回傳預設
+        return "臺北市"
 
 
 # ---- 3. 既有的天氣功能 (CWA API) ----
-# (此區塊完全不變，因為它不碰資料庫)
+# (此區塊完全不變)
 def get_weather_36h(location="臺北市") -> dict:
     if not CWA_API_KEY:
         return {"error": "尚未設定 CWA_API_KEY..."}
@@ -346,10 +322,10 @@ def get_weather_36h(location="臺北市") -> dict:
                 return {"error": f"查不到「{location}」的天氣資訊，請確認是否為臺灣的縣市。"}
             
             loc = locs[0]
-            wx  = loc["weatherElement"][0]["time"][0]["parameter"]["parameterName"]
-            pop = loc["weatherElement"][1]["time"][0]["parameter"]["parameterName"]
+            wx   = loc["weatherElement"][0]["time"][0]["parameter"]["parameterName"]
+            pop  = loc["weatherElement"][1]["time"][0]["parameter"]["parameterName"]
             minT = loc["weatherElement"][2]["time"][0]["parameter"]["parameterName"]
-            ci  = loc["weatherElement"][3]["time"][0]["parameter"]["parameterName"]
+            ci   = loc["weatherElement"][3]["time"][0]["parameter"]["parameterName"]
             maxT = loc["weatherElement"][4]["time"][0]["parameter"]["parameterName"]
             
             return {
@@ -368,7 +344,7 @@ def get_weather_36h(location="臺北市") -> dict:
             app.logger.error(f"CWA request error: {e}")
             return {"error": "氣象資料連線失敗，稍後再試。"}
         except Exception as e:
-            app.logger.error(f"CWAs parse error: {e}")
+            app.logger.error(f"CWA parse error: {e}")
             return {"error": "天氣資料解析失敗，稍後再試。"}
 
     app.logger.error(f"CWA SSL still failing after fallback: {last_err}")
@@ -376,7 +352,7 @@ def get_weather_36h(location="臺北市") -> dict:
 
 
 # ---- 4. AI 穿搭建議功能 ----
-# (此區塊完全不變，因為它呼叫的是 2.1 區塊的函式)
+# (此區塊完全不變)
 def get_clothing_advice(user_id: str, location: str) -> str:
     if not gemini_model:
         return "抱歉，AI 建議功能目前無法使用 (Gemini 未啟動)。"
@@ -415,7 +391,7 @@ def get_clothing_advice(user_id: str, location: str) -> str:
         else:
             prompt_parts.append("尚無聊天紀錄")
             
-        prompt_parts.append("\n--- Suggere-me ---") # (你這裡拼錯了，但我先保留，以免影響你的 prompt)
+        prompt_parts.append("\n--- Suggere-me ---") 
         prompt_parts.append(f"請根據 {weather_data['location']} 的天氣({weather_data['minT']}~{weather_data['maxT']}度，{weather_data['wx']})，以及使用者的偏好和聊天紀錄，直接開始提供建議：")
 
         final_prompt = "\n".join(prompt_parts)
@@ -465,125 +441,151 @@ def webhook():
 
                 # ⭐️ 呼叫 SQLAlchemy 版本的 add_chat_history
                 add_chat_history(user_id, "user", text)
-                reply = "" 
-
-                # ⭐️⭐️ 關鍵：新的指令路由 ⭐️⭐️
                 
-                if text.startswith("天氣"):
+                # ✅✅✅ --- START: 這是「全新」的 Webhook 邏輯 --- ✅✅✅
+                
+                # ⭐️ 1. 取得使用者物件 (包含他目前的狀態)
+                user = db.session.get(User, user_id)
+                if not user:
+                    # 如果使用者是第一次，建立一個新的
+                    user = User(line_user_id=user_id)
+                    db.session.add(user)
+                    try:
+                        db.session.commit()
+                    except Exception as e:
+                        app.logger.error(f"New user creation error: {e}")
+                        db.session.rollback()
+                        
+                user_state = user.session_state
+                
+                reply_msg_obj = None # 這是我們要回傳的「訊息物件」
+                reply_text = ""      # 這是我們要儲存到 DB 的「文字」
+
+                # ⭐️ 2. 檢查「狀態」：使用者是否正在回答上一個問題？
+                if user_state:
+                    # 清除狀態，代表我們已經收到答案
+                    user.session_state = None
+                    
+                    if user_state == "awaiting_region":
+                        # 使用者上一動是按「設定地區」，所以 'text' 就是地區
+                        reply_text = save_user_home_city(user_id, text)
+                    elif user_state == "awaiting_preference":
+                        # 使用者上一動是按「記住我」，所以 'text' 就是偏好
+                        reply_text = save_user_preference(user_id, text)
+                    else:
+                        # 狀態錯誤，保險起見
+                        reply_text = "發生了一點錯誤，請再試一次。"
+                    
+                    try:
+                        db.session.commit()
+                    except Exception as e:
+                        app.logger.error(f"Error committing state change: {e}")
+                        db.session.rollback()
+                        reply_text = "抱歉，儲存時發生錯誤。"
+
+                    reply_msg_obj = TextMessage(text=reply_text)
+
+                # ⭐️ 3. 檢查「關鍵字」：如果沒有狀態，才檢查關鍵字
+                
+                # (注意：你的圖文選單按鈕，送出的文字是 "記住我 " 和 "設定地區 " (有空格))
+                elif text == "記住我": # 👈 這是按鈕 (Rich Menu)
+                    user.session_state = "awaiting_preference" # 👈 設定狀態
+                    db.session.commit()
+                    reply_text = "好的，請告訴我您的「穿搭偏好」：\n（例如：我怕冷、我喜歡穿短褲）"
+                    reply_msg_obj = TextMessage(text=reply_text)
+                    
+                elif text == "設定地區": # 👈 這是按鈕 (Rich Menu)
+                    user.session_state = "awaiting_region" # 👈 設定狀態
+                    db.session.commit()
+                    reply_text = "好的，請輸入您要設定的「預設地區」：\n（例如：臺北市）"
+                    reply_msg_obj = TextMessage(text=reply_text)
+
+                elif text.startswith("天氣"):
                     city_text = text.replace("天氣", "", 1).strip()
                     city_norm = ""
                     reply_prefix = ""
-                    
                     if not city_text:
-                        # ⭐️ 呼叫 SQLAlchemy 版本的 get_user_home_city
                         city_norm = get_user_home_city(user_id)
                         reply_prefix = f"（您設定的地區：{city_norm}）\n\n"
                     else:
                         city_norm = normalize_city(city_text)
                     
                     if not city_norm:
-                        reply = f"抱歉，我不認識「{city_text}」。我目前只支援臺灣的縣市。"
+                        reply_text = f"抱歉，我不認識「{city_text}」。我目前只支援臺灣的縣市。"
                     else:
                         weather_data = get_weather_36h(city_norm)
                         if "error" in weather_data:
-                            reply = weather_data["error"]
+                            reply_text = weather_data["error"]
                         else:
-                            reply = reply_prefix + weather_data["full_text"]
-
-                elif text.startswith("記住我"):
-                    prefs = text.replace("記住我", "", 1).strip()
-                    if not prefs:
-                        reply = "請告訴我你的喜好，例如：「記住我 穿搭偏好：喜歡穿短褲」"
-                    else:
-                        # ⭐️ 呼叫 SQLAlchemy 版本的 save_user_preference
-                        reply = save_user_preference(user_id, prefs)
-                
+                            reply_text = reply_prefix + weather_data["full_text"]
+                    reply_msg_obj = TextMessage(text=reply_text)
+                    
                 elif text == "我的偏好":
-                    # ⭐️ 呼叫 SQLAlchemy 版本的 get_user_preference
                     prefs = get_user_preference(user_id)
-                    reply = f"您目前的偏好設定：\n\n{prefs}"
+                    reply_text = f"您目前的偏好設定：\n\n{prefs}"
+                    reply_msg_obj = TextMessage(text=reply_text)
 
                 elif text == "忘記我":
-                    # ⭐️ 呼叫 SQLAlchemy 版本的 clear_user_preference
-                    reply = clear_user_preference(user_id)
+                    reply_text = clear_user_preference(user_id)
+                    reply_msg_obj = TextMessage(text=reply_text)
+                    
+                elif text == "今天穿什麼" or text == "穿搭建議" or text == "給我穿搭建議":
+                    city = get_user_home_city(user_id)
+                    reply_text = get_clothing_advice(user_id, city)
+                    reply_msg_obj = TextMessage(text=reply_text)
 
+                # (我們也保留手動輸入的舊功能)
+                elif text.startswith("記住我"):
+                     prefs = text.replace("記住我", "", 1).strip()
+                     if not prefs:
+                         reply_text = "請告訴我你的喜好，例如：「記住我 穿搭偏好：喜歡穿短褲」"
+                     else:
+                         reply_text = save_user_preference(user_id, prefs)
+                     reply_msg_obj = TextMessage(text=reply_text)
+                         
                 elif text.startswith("設定地區"):
                     city_text = text.replace("設定地區", "", 1).strip()
                     if not city_text:
-                        reply = "請輸入地區，例如：「設定地區 新北市」"
+                         reply_text = "請輸入地區，例如：「設定地區 新北市」"
                     else:
-                        # ⭐️ 呼叫 SQLAlchemy 版本的 save_user_home_city
-                        reply = save_user_home_city(user_id, city_text)
+                         reply_text = save_user_home_city(user_id, city_text)
+                    reply_msg_obj = TextMessage(text=reply_text)
 
-                elif text == "今天穿什麼" or text == "穿搭建議" or text == "給我穿搭建議":
-                    # ⭐️ 呼叫 SQLAlchemy 版本的 get_user_home_city
-                    city = get_user_home_city(user_id)
-                    # ⭐️ 呼叫 SQLAlchemy 版本的 get_clothing_advice
-                    reply = get_clothing_advice(user_id, city)
-
-                # ✅✅✅ --- 這是「最終修正版」的 else 區塊 --- ✅✅✅
+                # ⭐️ 4. 檢查「其他」：如果以上皆非，才回覆按鈕
                 else:
-                    # ⭐️ 1. 建立「快速回覆」按鈕
                     qr_buttons = QuickReply(
                         items=[
-                            QuickReplyItem(  # ✅ 修正：使用 QuickReplyItem
-                                action=MessageAction(label="☀️ 看天氣", text="天氣")
-                            ),
-                            QuickReplyItem(  # ✅ 修正：使用 QuickReplyItem
-                                action=MessageAction(label="👕 穿搭建議", text="今天穿什麼")
-                            ),
-                            QuickReplyItem(  # ✅ 修正：使用 QuickReplyItem
-                                action=MessageAction(label="❤️ 我的偏好", text="我的偏好")
-                            ),
+                            QuickReplyItem(action=MessageAction(label="☀️ 看天氣", text="天氣")),
+                            QuickReplyItem(action=MessageAction(label="👕 穿搭建議", text="今天穿什麼")),
+                            QuickReplyItem(action=MessageAction(label="❤️ 我的偏好", text="我的偏好")),
                         ]
                     )
-
-                    # ⭐️ 2. 準備回覆的文字
                     reply_text = f"哈囉！你說了：{text}\n\n需要我幫你做什麼嗎？"
-                    
-                    # ⭐️ 3. 建立帶有按鈕的 TextMessage
                     reply_msg_obj = TextMessage(
                         text=reply_text,
-                        quick_reply=qr_buttons  # 關鍵！把按鈕加進來
+                        quick_reply=qr_buttons
                     )
-                    
-                    # ⭐️ 4. 儲存這筆 bot 的回覆到聊天紀錄
+
+                # ⭐️ 5. 統一回覆
+                if reply_text and reply_msg_obj:
                     add_chat_history(user_id, "bot", reply_text)
-                    
-                    # ⭐️ 5. 馬上回覆訊息 (包含按鈕)
                     line_bot_api.reply_message(
                         ReplyMessageRequest(
                             reply_token=reply_token,
-                            messages=[reply_msg_obj] # 傳送我們剛建立的「帶按鈕的訊息」
+                            messages=[reply_msg_obj]
                         )
                     )
-                    
-                    # ⭐️ 6. (重要) 因為我們已經手動回覆了，
-                    # 我們要用 `continue` 來跳過這個 event，
-                    # 避免程式跑到後面又試圖回覆一次
-                    continue
-                
-                # ✅✅✅ --- 這是「舊的、有問題的」邏輯 --- ✅✅✅
-                # (但它會被上面的 continue 跳過，所以不會再出錯)
-                if reply:
-                    # ⭐️ 呼叫 SQLAlchemy 版本的 add_chat_history
-                    add_chat_history(user_id, "bot", reply)
                 else:
-                    # ❌ (這就是你 1:28 AM 看到的 bug 發生點)
-                    reply = "抱歉，我不知道怎麼回應。"
+                    # 萬一發生錯誤，什麼都沒設定到
+                    app.logger.error(f"No reply_msg_obj generated for text: {text}")
 
-                line_bot_api.reply_message(
-                    ReplyMessageRequest(
-                        reply_token=reply_token,
-                        messages=[TextMessage(text=reply)]
-                    )
-                )
+                # ✅✅✅ --- END: 這是「全新」的 Webhook 邏輯 --- ✅✅✅
+
     return "OK"
 
 
 # ⭐️ ---- 6. ⭐️ 移除多餘的函式 ----
-# def create_all_tables(): ... 
-# ⭐️ (已移除，功能移到檔案頂部)
+# ( ... )
 
 if __name__ == "__main__":
     # ⭐️ (本地測試時，頂部的 db.create_all() 也會自動執行)
