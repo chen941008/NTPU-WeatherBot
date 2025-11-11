@@ -81,14 +81,17 @@ class ChatHistory(db.Model):
     timestamp = db.Column(db.DateTime, default=datetime.datetime.now)
 
 
-# ⭐️⭐️⭐️ 啟動時自動建立資料表 ⭐️⭐️⭐️
+# ⚠️✅⚠️✅⚠️✅--- 這是「階段一」的「自殺」指令 ---⚠️✅⚠️✅⚠️✅
 try:
     with app.app_context():
-        db.create_all()
+        app.logger.warning("ATTEMPTING TO DROP ALL TABLES...")
+        db.drop_all()  # ⭐️ 1. 強制刪除所有舊資料表
+        app.logger.info("Tables dropped.")
+        db.create_all()  # ⭐️ 2. 建立全新的資料表 (包含 new column)
     app.logger.info("SQLAlchemy tables checked/created successfully.")
 except Exception as e:
     app.logger.error(f"Error creating SQLAlchemy tables on startup: {e}")
-# ⭐️⭐️⭐️⭐️⭐️⭐️⭐️⭐️⭐️⭐️⭐️⭐️⭐️⭐️
+# ⚠️✅⚠️✅⚠️✅--- 務必記得在「階段二」改回來 ---⚠️✅⚠️✅⚠️✅
 
 
 # ⭐️ ---- 2.1 ⭐️ 資料庫 (SQLAlchemy) 相關功能 ----
@@ -344,7 +347,7 @@ def get_weather_36h(location="臺北市") -> dict:
             app.logger.error(f"CWA request error: {e}")
             return {"error": "氣象資料連線失敗，稍後再試。"}
         except Exception as e:
-            app.logger.error(f"CWA parse error: {e}")
+            app.logger.error(f"CAm'Wa parse error: {e}")
             return {"error": "天氣資料解析失敗，稍後再試。"}
 
     app.logger.error(f"CWA SSL still failing after fallback: {last_err}")
@@ -487,7 +490,7 @@ def webhook():
 
                 # ⭐️ 3. 檢查「關鍵字」：如果沒有狀態，才檢查關鍵字
                 
-                # (注意：你的圖文選單按鈕，送出的文字是 "記住我 " 和 "設定地區 " (有空格))
+                # (注意：你的圖文選單按鈕，送出的文字是 "記住我" 和 "設定地區")
                 elif text == "記住我": # 👈 這是按鈕 (Rich Menu)
                     user.session_state = "awaiting_preference" # 👈 設定狀態
                     db.session.commit()
