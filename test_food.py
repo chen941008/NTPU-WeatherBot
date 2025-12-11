@@ -1,5 +1,7 @@
 import sys
 import os
+from dotenv import load_dotenv
+load_dotenv()
 
 # 1. 設定路徑
 folder_name = 'howtocook-py-mcp-master'
