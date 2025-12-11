@@ -8,6 +8,7 @@ import random
 import json
 from flask import Flask, request
 from dotenv import load_dotenv
+from urllib.parse import quote
 
 print("3. 正在匯入資料庫套件 (SQLAlchemy)...")
 from flask_sqlalchemy import SQLAlchemy
@@ -20,9 +21,14 @@ from linebot.v3.webhook import WebhookParser
 from linebot.v3.messaging import (
     Configuration, ApiClient, MessagingApi,
     ReplyMessageRequest, TextMessage,
-    QuickReply, QuickReplyItem, MessageAction
+    QuickReply, QuickReplyItem, MessageAction,
+    URIAction
 )
-
+from linebot.v3.webhooks import (
+    MessageEvent,
+    TextMessageContent,
+    LocationMessageContent
+)
 print("6. 套件匯入完成！準備啟動伺服器...")
 
 load_dotenv()
@@ -32,7 +38,7 @@ app = Flask(__name__)
 CHANNEL_SECRET = os.getenv("LINE_CHANNEL_SECRET")
 CHANNEL_TOKEN  = os.getenv("LINE_CHANNEL_ACCESS_TOKEN")
 CWA_API_KEY    = os.getenv("CWA_API_KEY")
-GOOGLE_API_KEY = os.getenv("GOOGLE_API_KEY")
+GOOGLE_API_KEY = os.getenv("GOOGLE_API_KEY") # 這行也需要修正，確保變數名一致
 
 # 資料庫設定
 database_url = os.environ.get('DATABASE_URL')
@@ -345,6 +351,146 @@ def get_random_recipe():
     desc = dish.get('description', '')[:100]
     return f"🍳 隨機推薦：{name}\n📂 分類：{category}\n📝 簡介：{desc}...\n\n(想知道怎麼做嗎？請輸入「食譜 {name}」)"
 
+# ---- 5.2 運勢功能 (New!) ----
+def get_fortune(user_id, user_mood):
+    if not gemini_model: return "抱歉，AI 運勢功能目前無法使用。"
+    
+    # 這裡你需要修改成你實際取得地區的邏輯
+    user_location = get_user_home_city(user_id) # 假設你的函式是 get_user_home_city
+    
+    # 呼叫現有的天氣查詢函式
+    weather_data = get_weather_36h(user_location)
+    
+    if "error" in weather_data:
+        weather_info = f"（無法取得 {user_location} 的天氣，請提供通用運勢）"
+    else:
+        weather_info = weather_data['full_text']
+        
+    system_prompt = (
+       "你是「貼心生活氣象台」AI，專門提供情緒化、有趣的運勢報告。 "
+        "請根據提供的天氣和心情資訊，生成一份運勢報告。\n"
+        
+        "**報告必須包含以下四項，且必須使用繁體中文、表情符號和條列式呈現：**\n"
+        "1. **今日情緒天氣**：用一個天氣詞彙比喻使用者狀態。\n"
+        "2. **今日美食吉籤**：給予一個適合今日心情/天氣的美食建議。\n"
+        "3. **今日穿搭提醒**：提供基於天氣的簡短穿搭建議。\n"
+        "4. **今日幸運小物 (必填)**：請務必指定一個簡單的、容易攜帶的「幸運小物」。\n" # ⭐ 強化必填
+        
+        "請將所有資訊整合為一個簡潔的回覆，總長度不超過 150 字。"
+    )
+    
+    final_prompt = system_prompt + "\n\n" + (
+        f"請幫我生成一份運勢報告。今日天氣是：{weather_info}。 "
+        f"我的心情是：{user_mood}" # ⭐ 把心情加進去
+    )
+
+    try:
+        # 呼叫 Gemini API
+        response = gemini_model.generate_content(final_prompt)
+        return response.text
+        
+    except Exception as e:
+        print(f"Gemini API 呼叫失敗: {e}")
+        return "運勢生成器故障了！請稍後再試試看。"
+# ---- 5.3 食材替代建議功能 (New!) ----
+def get_substitute_suggestion(target_ingredient: str) -> str:
+    """根據使用者提供的目標食材，建議合適的替代品"""
+    if not gemini_model: return "抱歉，AI 建議功能目前無法使用。"
+    
+    prompt = f"""
+    你是「聰明主廚 AI」，專門提供專業且實用的食材替代方案。
+    
+    使用者想知道：【{target_ingredient}】的最佳替代品是什麼？
+    
+    任務：
+    1. **提供 3 個最佳替代方案**（例如：如果你要找雞蛋的替代品，可以提供香蕉泥、亞麻籽粉、或市售蛋替代品）。
+    2. 針對每個替代品，**簡要說明**它在料理中的作用（例如：提供黏性、增加甜度、維持濕度）。
+    3. 說明使用替代品時，**份量應該如何調整**（例如：1 顆雞蛋約等於半根香蕉泥）。
+    4. 最後鼓勵使用者在緊急時試試看。
+    5. 請使用親切、幽默的語氣，並使用繁體中文和條列式呈現，總長度不超過 150 字。
+    """
+    
+    try:
+        response = gemini_model.generate_content(prompt)
+        return response.text
+    except Exception as e:
+        app.logger.error(f"AI Substitute Error: {e}")
+        return "AI 在分析替代方案時發生錯誤，請稍後再試。"
+# ---- 5.4 附近景點搜尋功能 (Google Maps) ----
+def get_nearby_places(lat, lng):
+    api_key = os.getenv("GOOGLE_MAPS_API_KEY")
+    if not api_key: return "錯誤：找不到 Google Maps API Key。"
+
+    # Google Places API (搜尋半徑 1500公尺內的 'tourist_attraction')
+    url = "https://maps.googleapis.com/maps/api/place/nearbysearch/json"
+    params = {
+        "location": f"{lat},{lng}",
+        "radius": 1500,
+        "type": "tourist_attraction", # 你也可以改成 restaurant (餐廳) 或 cafe (咖啡廳)
+        "language": "zh-TW",
+        "key": api_key
+    }
+
+    try:
+        response = requests.get(url, params=params)
+        data = response.json()
+        
+        if data.get("status") == "OK":
+            results = data.get("results", [])[:5]
+            if not results: return {"error": "附近好像沒有特別著名的景點耶。"}
+
+            # ⭐️ MODIFIED: 儲存景點資訊和連結
+            places_for_ai = []      # 給 Gemini 看的文字描述
+            places_for_line = []    # 給 LINE QuickReply 用的結構化資料
+            
+            for i, place in enumerate(results):
+                name = place.get("name")
+                rating = place.get("rating", "無評分")
+                place_id = place.get("place_id")
+                
+                encoded_name = quote(name)
+
+                # 修正後的 Google Maps 導航連結
+                # 1. 確保開頭是 https://
+                # 2. 將未編碼的 name 替換為 encoded_name
+                maps_url = f"https://www.google.com/maps/search/?api=1&query={encoded_name}&query_place_id={place_id}" 
+                
+                # 1. 儲存給 LINE 模板用的資料 (使用原名)
+                places_for_line.append({
+                    "name": name,
+                    "maps_url": maps_url
+                })
+                
+                # 2. 儲存給 AI 看的資料 (加上編號，讓 AI 引用)
+                places_for_ai.append(
+                    f"{i + 1}. {name} (⭐{rating})"
+                )
+            
+            places_str = "\n".join(places_for_ai)
+
+            # 呼叫 Gemini 當導遊 (讓它專注生成文字，並引用編號)
+            prompt = f"""
+            使用者現在位於某個地點，附近有以下 5 個景點編號與名稱：
+            {places_str}
+
+            請扮演一位「熱情活潑的在地導遊」，根據以上清單：
+            1. 挑選 3 個你認為最值得去的地方。
+            2. 用生動的語言介紹它們。
+            3. **回覆內容只需要生成介紹文字，但必須明確提到你推薦的景點名稱或編號，以便使用者知道要點選哪個按鈕。**
+            4. 加上 Emoji。
+            """
+            response = gemini_model.generate_content(prompt)
+            # ⭐ 函式回傳：AI 的介紹文字和結構化的景點清單 (給 LINE 準備按鈕)
+            return {
+                "ai_text": response.text, 
+                "places_data": places_for_line,
+                "error": None
+            }
+        else:
+            return "Google Maps 暫時無法回應，請稍後再試。"
+    except Exception as e:
+        print(f"Maps API Error: {e}")
+        return "搜尋景點時發生錯誤。"
 def analyze_intent(user_text):
     """
     使用 AI 來判斷使用者的意圖 (Intent Classification) (已新增食材推薦意圖)
@@ -372,7 +518,17 @@ def analyze_intent(user_text):
     5. 如果使用者想根據現有食材推薦菜色 (例如：我只有雞蛋和番茄可以做什麼、冰箱只剩豆腐)：
        回傳：{{"intent": "suggest_by_ingredients", "ingredients": "擷取出的食材清單 (以逗號分隔)"}}
 
-    6. 其他閒聊或無法判斷：
+    
+    6. 如果使用者想問今日運勢、抽籤、問運氣、或問美食/穿搭的運氣 (例如：今天運氣如何、抽籤、今日運勢)：
+       回傳：{{"intent": "fortune"}}
+
+    7. 如果使用者想問食材替代品 (例如：醬油可以用什麼代替、沒有雞蛋怎麼辦、香菜的替代品)：
+       回傳：{{"intent": "substitute_ingredient", "target": "擷取出的目標食材或調味料"}}
+
+    8. 如果使用者問附近哪裡好玩、推薦景點 (例如：這附近有什麼好玩的、推薦附近景點)：
+       回傳：{{"intent": "search_nearby"}}
+
+    9. 其他閒聊或無法判斷：
        回傳：{{"intent": "chat"}}
     """
     
@@ -439,6 +595,7 @@ def search_recipe_by_ai(keyword):
         return "AI 在讀取食譜時頭暈了，請稍後再試。"
 
 
+
 # ---- 6. Flask Webhook 路由 ----
 @app.get("/health")
 def health(): return "OK"
@@ -453,132 +610,221 @@ def webhook():
 
     with ApiClient(configuration) as api_client:
         line_bot_api = MessagingApi(api_client)
+        # 統一定義功能選單的 QuickReply 按鈕 (最終 MODIFIED)
+        feature_quick_reply = QuickReply(
+            items=[
+                # 氣象相關
+                QuickReplyItem(action=MessageAction(label="🌤️ 查詢天氣", text="天氣")),
+                QuickReplyItem(action=MessageAction(label="👕 客製穿搭建議", text="今天穿什麼")),
+                
+                # 景點與娛樂 (NEW: 今日運勢 / 附近景點)
+                QuickReplyItem(action=MessageAction(label="🗺️ 附近景點 (Google Map)", text="附近哪裡好玩")), # 補上
+                QuickReplyItem(action=MessageAction(label="🔮 今日運勢", text="今日運勢")), # 補上
+                
+                # 食物相關
+                QuickReplyItem(action=MessageAction(label="🍽️ 食譜/食材 (今天吃什麼)", text="今天吃什麼")),
+                
+                # 設定相關
+                QuickReplyItem(action=MessageAction(label="⚙️ 設定：穿搭偏好", text="設定穿搭偏好")), 
+                QuickReplyItem(action=MessageAction(label="🔑 帳號設定/地區", text="設定地區")),
+            ]
+        )
         for event in events:
+            
+            # ==========================================
+            # 情況 1：使用者傳送「文字」
+            # ==========================================
             if event.type == "message" and getattr(event, "message", None) and event.message.type == "text":
                 text = (event.message.text or "").strip()
                 reply_token = event.reply_token
                 if event.source and event.source.type == "user": user_id = event.source.user_id
                 else: continue 
 
+                # 1. 記錄文字歷史
                 add_chat_history(user_id, "user", text)
                 
-                # 使用者狀態管理
-                user = db.session.get(User, user_id)
-                if not user:
-                    user = User(line_user_id=user_id)
-                    db.session.add(user)
-                    try: db.session.commit()
-                    except: db.session.rollback()
-                
-                user_state = user.session_state
-                reply_msg_obj = None 
-                reply_text = ""      
-
-                # ==========================================
-                # 1. 最高優先級：處理「狀態」(強制流程)
-                # ==========================================
-                if user_state:
-                    user.session_state = None
-                    if user_state == "awaiting_region":
-                        reply_text = save_user_home_city(user_id, text)
-                    elif user_state == "awaiting_preference":
-                        reply_text = save_user_preference(user_id, text)
-                    else:
-                        reply_text = "發生錯誤，請再試一次。"
-                    try: db.session.commit()
-                    except: db.session.rollback()
-                    reply_msg_obj = TextMessage(text=reply_text)
-
-                # ==========================================
-                # 2. 次高優先級：處理「按鈕指令」(Exact Match)
-                # ==========================================
-                elif text == "記住我": 
-                    user.session_state = "awaiting_preference"
-                    db.session.commit()
-                    reply_text = "好的，請告訴我您的「穿搭偏好」：\n（例如：我怕冷、我喜歡穿短褲）"
+                # 2. 取得使用者與狀態
+                with app.app_context(): # 確保 DB 操作在 context 內
+                    user = db.session.get(User, user_id)
+                    if not user:
+                        user = User(line_user_id=user_id)
+                        db.session.add(user)
+                        try: db.session.commit()
+                        except: db.session.rollback()
                     
-                elif text == "設定地區": 
-                    user.session_state = "awaiting_region"
-                    db.session.commit()
-                    reply_text = "好的，請輸入您要設定的「預設地區」：\n（例如：臺北市）"
+                    user_state = user.session_state
+                    reply_msg_obj = None 
+                    reply_text = ""   
 
-                elif text == "我的偏好":
-                    prefs = get_user_preference(user_id)
-                    reply_text = f"您目前的偏好設定：\n\n{prefs}"
+                    # 3. 判斷時間生成問候語
+                    current_hour = datetime.datetime.now().hour
+                    if 5 <= current_hour < 12: greeting = "早安！☀️"
+                    elif 12 <= current_hour < 18: greeting = "午安！☕️"
+                    else: greeting = "晚安！🌙"
 
-                elif text == "忘記我":
-                    reply_text = clear_user_preference(user_id)
-                
-                # 這裡把原本硬寫的食譜/天氣也搬到 AI Router 處理，因此不再需要這裡的 elif text.startswith("天氣") 等硬規則。
-                # 舊的硬規則已被移除。
-
-                # ==========================================
-                # 3. 剩下的所有文字 -> 交給 AI 判斷意圖！
-                # ==========================================
-                else:
-                    # 呼叫我們剛寫的 AI 判斷函式
-                    ai_result = analyze_intent(text)
-                    intent = ai_result.get("intent")
-                    
-                    print(f"使用者輸入: {text} -> AI 判斷意圖: {intent}")
-
-                    if intent == "search_recipe":
-                        keyword = ai_result.get("keyword")
-                        # 如果 AI 沒抓到關鍵字，就用整句去搜
-                        if not keyword: keyword = text
-                        reply_text = search_recipe_by_ai(keyword)
-                        
-                    elif intent == "random_recipe":
-                        reply_text = get_random_recipe()
-
-                    # ⭐️ 處理新的食材推薦意圖
-                    elif intent == "suggest_by_ingredients":
-                        ingredients = ai_result.get("ingredients")
-                        reply_text = suggest_recipe_by_ingredients(user_id, ingredients)
-                        
-                    elif intent == "weather":
-                        city = ai_result.get("location")
-                        if not city:
-                            city = get_user_home_city(user_id) # 如果沒說地點，就用預設的
-                        
-                        norm_city = normalize_city(city)
-                        if norm_city:
-                            w_data = get_weather_36h(norm_city)
-                            reply_text = w_data.get("full_text", "查詢失敗")
+                    # 4. 優先處理狀態
+                    if user_state:
+                        user.session_state = None
+                        if user_state == "awaiting_region":
+                            reply_text = save_user_home_city(user_id, text)
+                        elif user_state == "awaiting_preference":
+                            reply_text = save_user_preference(user_id, text)
+                        elif user_state == "awaiting_mood":
+                            reply_text = get_fortune(user_id, text) # 這裡用 text 當作心情
                         else:
-                            reply_text = f"抱歉，我不確定您問的是哪個縣市 ({city})，請先設定地區或明示地名。"
+                            reply_text = "發生錯誤，請再試一次。"
+                        try: db.session.commit()
+                        except: db.session.rollback()
+                        reply_msg_obj = TextMessage(text=reply_text)
 
-                    elif intent == "clothing_advice":
-                        city = get_user_home_city(user_id)
-                        reply_text = get_clothing_advice(user_id, city)
+                    # 5. 處理按鈕指令
+                    elif text == "記住我": 
+                        user.session_state = "awaiting_preference"
+                        db.session.commit()
+                        reply_text = "好的，請告訴我您的「穿搭偏好」：\n（例如：我怕冷、我喜歡穿短褲）"
+                        reply_msg_obj = TextMessage(text=reply_text)
                         
-                    else: # intent == "chat"
-                        # AI 判定為閒聊，回覆預設選單
-                        qr_buttons = QuickReply(
-                            items=[
-                                QuickReplyItem(action=MessageAction(label="☀️ 看天氣", text="天氣")),
-                                QuickReplyItem(action=MessageAction(label="👕 穿搭建議", text="今天穿什麼")),
-                                QuickReplyItem(action=MessageAction(label="🍳 今天吃什麼", text="今天吃什麼")),
-                                QuickReplyItem(action=MessageAction(label="💡 食材推薦", text="我只有雞蛋、蔥、醬油")), # 新增推薦按鈕範例
-                                QuickReplyItem(action=MessageAction(label="🔍 搜尋食譜", text="食譜 番茄炒蛋")), 
-                                QuickReplyItem(action=MessageAction(label="⚙️ 設定地區", text="設定地區")),
-                            ]
+                    elif text == "設定地區": 
+                        user.session_state = "awaiting_region"
+                        db.session.commit()
+                        reply_text = "好的，請輸入您要設定的「預設地區」：\n（例如：臺北市）"
+                        reply_msg_obj = TextMessage(text=reply_text)
+
+                    elif text == "我的偏好":
+                        prefs = get_user_preference(user_id)
+                        reply_text = f"您目前的偏好設定：\n\n{prefs}"
+                        reply_msg_obj = TextMessage(text=reply_text)
+
+                    elif text == "忘記我":
+                        reply_text = clear_user_preference(user_id)
+                        reply_msg_obj = TextMessage(text=reply_text)
+                    
+                    # 6. AI 意圖判斷
+                    else:
+                        ai_result = analyze_intent(text)
+                        intent = ai_result.get("intent")
+                        print(f"使用者輸入: {text} -> AI 判斷意圖: {intent}")
+
+                        if intent == "search_recipe":
+                            keyword = ai_result.get("keyword")
+                            if not keyword: keyword = text
+                            reply_text = search_recipe_by_ai(keyword)
+                            
+                        elif intent == "random_recipe":
+                            reply_text = get_random_recipe()
+
+                        elif intent == "suggest_by_ingredients":
+                            ingredients = ai_result.get("ingredients")
+                            reply_text = suggest_recipe_by_ingredients(user_id, ingredients)
+                            
+                        elif intent == "weather":
+                            city = ai_result.get("location")
+                            if not city: city = get_user_home_city(user_id)
+                            norm_city = normalize_city(city)
+                            if norm_city:
+                                w_data = get_weather_36h(norm_city)
+                                reply_text = w_data.get("full_text", "查詢失敗")
+                            else:
+                                reply_text = f"抱歉，我不確定您問的是哪個縣市 ({city})。"
+
+                        elif intent == "clothing_advice":
+                            city = get_user_home_city(user_id)
+                            reply_text = get_clothing_advice(user_id, city)
+                            if reply_text:
+                                reminder_text = (
+                                    "\n\n---\n"
+                                    "💡 **貼心提醒：** 您可以輸入「記住我」或「設定穿搭偏好」來客製化建議喔！"
+                                )
+                                reply_text += reminder_text
+                            if reply_text:
+                                reply_msg_obj = TextMessage(text=reply_text)
+                            else:
+                                # 如果函式回傳失敗，則回覆預設訊息
+                                reply_msg_obj = TextMessage(text="抱歉，目前無法提供穿搭建議。")
+
+                        elif intent == "fortune":
+                            user.session_state = "awaiting_mood" 
+                            db.session.commit()
+                            reply_text = f"{greeting} 在為你分析今日運勢之前，請用幾個字告訴我你現在的心情如何呢？😊"
+                            reply_msg_obj = TextMessage(text=reply_text)
+
+                        elif intent == "search_nearby":
+                            # 回覆一個「請求位置」的按鈕
+                            reply_text = "沒問題！請點擊下方按鈕，傳送您的位置給我，我來幫您找找附近好玩的地方！👇"
+                            qr_buttons = QuickReply(
+                                items=[
+                                    QuickReplyItem(action=MessageAction(label="📍 傳送我的位置", type="location"))
+                                ]
+                            )
+                            reply_msg_obj = TextMessage(text=reply_text, quick_reply=qr_buttons)
+                        
+                        else: # intent == "chat"
+                            # 🚨 MODIFIED: 不再重新定義 QuickReply，而是直接使用在函式開頭定義的變數
+                        
+                        # 這是給使用者輸入 Bot 不理解內容時的回覆
+                            reply_text = f"你說了：「{text}」\n需要我幫你做什麼嗎？以下是您可以使用的功能："
+                        
+                        # ⭐ 關鍵：使用 feature_quick_reply (假設你在最上方已完整定義)
+                            reply_msg_obj = TextMessage(text=reply_text, quick_reply=feature_quick_reply)
+
+                    # 7. 統一回覆文字
+                    if reply_text and not reply_msg_obj:
+                        reply_msg_obj = TextMessage(text=reply_text)
+
+                    if reply_msg_obj:
+                        add_chat_history(user_id, "bot", reply_text or "image/template")
+                        line_bot_api.reply_message(ReplyMessageRequest(reply_token=reply_token, messages=[reply_msg_obj]))
+
+            # ==========================================
+            # 情況 2：使用者傳送「位置訊息」(Google Maps)
+            # ==========================================
+            elif event.type == "message" and getattr(event, "message", None) and event.message.type == "location":
+                user_id = event.source.user_id
+                latitude = event.message.latitude
+                longitude = event.message.longitude
+                
+                # 呼叫 Google Maps 函式，現在會回傳字典
+                result = get_nearby_places(latitude, longitude)
+                
+                if result.get("error"):
+                    reply_msg = TextMessage(text=result["error"])
+                else:
+                    # 1. 取得 AI 介紹文字和景點數據
+                    ai_text = result["ai_text"]
+                    places_data = result["places_data"]
+                    
+                    # 2. 準備 QuickReply 按鈕
+                    quick_reply_items = []
+                    
+                    for p in places_data:
+                        # 限制按鈕文字長度 (LINE 限制 20 字)
+                        button_label = f"📍 導航: {p['name'][:10]}..." 
+                        
+                        quick_reply_items.append(
+                             QuickReplyItem(
+                                action=URIAction(label=button_label, uri=p['maps_url'])
+                             )
                         )
-                        reply_text = f"你說了：「{text}」\n需要我幫你做什麼嗎？"
-                        reply_msg_obj = TextMessage(text=reply_text, quick_reply=qr_buttons)
+                    
+                    # 3. 組合最終回覆
+                    final_text = ai_text + "\n\n---\n\n點擊下方按鈕，直接導航至 AI 推薦的景點："
+                    
+                    reply_msg = TextMessage(
+                        text=final_text,
+                        quick_reply=QuickReply(items=quick_reply_items)
+                    )
 
-                # ==========================================
-                # 4. 統一發送
-                # ==========================================
-                if reply_text and not reply_msg_obj:
-                    reply_msg_obj = TextMessage(text=reply_text)
-
-                if reply_msg_obj:
-                    add_chat_history(user_id, "bot", reply_text or "image/template")
-                    line_bot_api.reply_message(ReplyMessageRequest(reply_token=reply_token, messages=[reply_msg_obj]))
+                # 回覆結果
+                line_bot_api.reply_message(
+                    ReplyMessageRequest(
+                        reply_token=event.reply_token,
+                        messages=[reply_msg]
+                    )
+                )
 
     return "OK"
 
 if __name__ == "__main__":
     port = int(os.getenv("PORT", 3000))
     app.run(host="0.0.0.0", port=port, debug=False)
+    #print("sa;ldkjoifd;sfjlkjhgerht ln ")
