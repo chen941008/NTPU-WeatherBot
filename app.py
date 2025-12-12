@@ -5,9 +5,13 @@ import random
 import json
 from typing import List, Dict, Any, Optional, Union
 from urllib.parse import quote
+import opencc
 
 import requests
 import certifi
+import urllib3
+from sentence_transformers import SentenceTransformer, util
+import torch
 import google.generativeai as genai
 from google.api_core import exceptions
 from flask import Flask, request, abort
@@ -16,7 +20,7 @@ from dotenv import load_dotenv
 
 from linebot.v3.webhook import WebhookParser
 from linebot.v3.messaging import (
-    Configuration, ApiClient, MessagingApi,
+    Configuration, ApiClient, MessagingApi, MessagingApiBlob,
     ReplyMessageRequest, TextMessage,
     QuickReply, QuickReplyItem, MessageAction,
     URIAction
@@ -24,8 +28,12 @@ from linebot.v3.messaging import (
 from linebot.v3.webhooks import (
     MessageEvent,
     TextMessageContent,
-    LocationMessageContent
+    LocationMessageContent,
+    ImageMessageContent
 )
+
+# urllib3 警告關閉
+urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
 # 設定日誌記錄 (Logging Setup)
 logging.basicConfig(
@@ -39,6 +47,218 @@ load_dotenv()
 
 # 初始化 Flask 應用程式
 app = Flask(__name__)
+
+# ---- 🚀 BGE-M3 向量搜尋引擎初始化 ----
+print("正在載入 BGE-M3 模型 (第一次執行需下載，請耐心等候)...", flush=True)
+# 載入模型 (會自動使用 GPU，如果沒有則用 CPU)
+embedding_model = SentenceTransformer('BAAI/bge-m3')
+
+# 定義意圖與標準問句 (Knowledge Base)
+# 這裡定義你希望機器人聽懂的句子
+# 定義意圖與標準問句 (Knowledge Base) - AI 增強版
+INTENT_KNOWLEDGE_BASE = {
+    # ----------------------------------------------------
+    # 打招呼與閒聊防護網 (最重要的防誤判層)
+    # ----------------------------------------------------
+    "greeting": [
+        "你好", "哈囉", "嗨", "早安", "午安", "晚安", "Hi", "Hello", 
+        "有人在嗎", "安安", "嘿", "Yo", "早", "機器人你好", "測試", 
+        "在嗎", "出來面對", "哈囉你好", "晚安囉"
+    ],
+
+    # ----------------------------------------------------
+    # 天氣相關 (加入帶傘、曬衣、溫度感受)
+    # ----------------------------------------------------
+    "weather": [
+        # 直問
+        "天氣如何", "查詢天氣", "氣溫幾度", "現在幾度", "台北天氣", "下雨機率",
+        # 帶傘情境
+        "外面有下雨嗎", "要帶傘嗎", "會下雨嗎", "出門要不要帶雨具", "有沒有降雨機率",
+        # 穿衣/冷熱情境
+        "明天會冷嗎", "熱死人了", "今天好冷喔", "週末天氣好嗎", "適合出遊嗎",
+        # 簡短
+        "天氣", "氣象", "下雨", "溫度"
+    ],
+
+    # ----------------------------------------------------
+    # 穿搭建議 (加入場合、洋蔥式、保暖)
+    # ----------------------------------------------------
+    "clothing_advice": [
+        # 直問
+        "今天穿什麼", "穿搭建議", "怎麼穿比較好", "給點穿搭意見",
+        # 情境
+        "外面冷嗎要穿外套嗎", "適合穿短袖嗎", "穿這樣會冷嗎", "需不需要穿大衣",
+        "要穿長袖還是短袖", "洋蔥式穿法", "今天適合穿裙子嗎",
+        # 需求
+        "怕冷怎麼穿", "騎車要穿什麼", "今天風大嗎要穿什麼", "有沒有穿搭靈感"
+    ],
+
+    # ----------------------------------------------------
+    # 食譜查詢 (加入想做菜、教學、特定菜名)
+    # ----------------------------------------------------
+    "search_recipe": [
+        # 意圖
+        "教我做菜", "食譜查詢", "作法教學", "怎麼煮", "料理教學", "我想學做菜",
+        # 具體菜色範例 (讓向量知道這類句型)
+        "怎麼煮紅燒肉", "我想學做義大利麵", "番茄炒蛋作法", "宮保雞丁怎麼弄",
+        "教我煮咖哩", "我想吃麻婆豆腐", "牛肉麵食譜", "三杯雞作法", 
+        # 關鍵字
+        "紅燒魚", "炒高麗菜", "玉米濃湯", "食譜"
+    ],
+
+    # ----------------------------------------------------
+    # 冰箱剩菜/食材推薦 (加入清冰箱、剩下什麼)
+    # ----------------------------------------------------
+    "suggest_by_ingredients": [
+        # 冰箱情境
+        "冰箱只剩雞蛋", "清冰箱料理", "冰箱有番茄可以做什麼", "家裡只有麵條",
+        "剩菜怎麼煮", "幫我消耗食材", "只有豆腐怎麼辦", "冰箱剩這些",
+        # 推薦請求
+        "食材推薦", "我有洋蔥和蛋", "用雞胸肉做一道菜", "這些材料能煮什麼",
+        "推薦一道用馬鈴薯的菜", "幫我想料理"
+    ],
+
+    # ----------------------------------------------------
+    # 隨機食譜 (加入飢餓、選擇困難、三餐)
+    # ----------------------------------------------------
+    "random_recipe": [
+        # 選擇困難
+        "晚餐吃什麼", "午餐吃什麼", "早餐吃什麼", "幫我決定晚餐", "不知道吃什麼",
+        "隨便推薦一道菜", "我想不到要吃啥", "有什麼好吃的", "推薦晚餐",
+        # 飢餓表達
+        "肚子好餓", "快餓扁了", "餓了", "想吃好料的", "隨便來一道", 
+        "今晚吃什麼", "介紹一道菜"
+    ],
+
+    # ----------------------------------------------------
+    # 食材替代 (加入缺料、沒有X怎麼辦)
+    # ----------------------------------------------------
+    "substitute_ingredient": [
+        # 缺料情境
+        "沒有醬油怎麼辦", "奶油可以用什麼代替", "缺少調味料", "家裡沒糖了",
+        "沒有米酒", "可以用牛奶代替鮮奶油嗎", "沒有太白粉",
+        # 替代詢問
+        "替代食材", "這可以用什麼換", "有什麼替代品", "如果不加這個會怎樣",
+        "沒買到洋蔥"
+    ],
+
+    # ----------------------------------------------------
+    # 運勢 (加入星座、運氣、占卜)
+    # ----------------------------------------------------
+    "fortune": [
+        "今日運勢", "運氣如何", "抽籤", "占卜", "好運嗎", "星座運勢",
+        "我今天運氣好嗎", "水逆了嗎", "幫我算命", "今日宜忌", "我的運勢",
+        "處女座運勢", "今天會幸運嗎"
+    ],
+
+    # ----------------------------------------------------
+    # 附近景點 (加入無聊、出去玩、導覽)
+    # ----------------------------------------------------
+    "search_nearby": [
+        # 直問
+        "附近有什麼好玩的", "推薦景點", "這附近哪裡好玩", "旅遊推薦", "導覽",
+        # 玩樂需求
+        "好無聊喔", "我想出去玩", "假日去哪裡", "帶我去玩", "附近有什麼地標",
+        "哪裡適合約會", "附近景點", "好玩的", "我要去玩"
+    ]
+}
+
+# 初始化簡轉繁轉換器
+cc = opencc.OpenCC('s2t')
+CACHED_RECIPES = [] 
+RECIPE_EMBEDDINGS = None
+
+# ==========================================
+# 🚀 系統啟動流程修正
+# 邏輯：檢查本地 -> (無)強制下載 -> 轉繁體 -> 注入意圖 -> 向量化
+# ==========================================
+
+def startup_load_recipes():
+    """
+    [修正版] 啟動載入：讀取 -> 轉繁體 -> 建立兩階段向量索引
+    """
+    global CACHED_RECIPES, RECIPE_EMBEDDINGS
+    
+    recipe_json_path = "recipes.json"
+    data = []
+    cleaned = [] # 🔥 關鍵修正：先初始化為空列表，防止 NameError
+
+    # 1. 嘗試讀取本地
+    if os.path.exists(recipe_json_path):
+        print(f"📂 發現本地食譜檔案，正在讀取...", flush=True)
+        try:
+            with open(recipe_json_path, "r", encoding="utf-8") as f:
+                data = json.load(f)
+        except Exception as e:
+            print(f"❌ 本地讀取失敗: {e}，將嘗試網路下載。", flush=True)
+    
+    # 2. 如果本地沒有，強制下載
+    if not data:
+        print(f"🌐 正在從網路下載食譜資料庫...", flush=True)
+        try:
+            response = requests.get(RECIPES_URL, timeout=60)
+            if response.status_code == 200:
+                data = response.json()
+                with open(recipe_json_path, "w", encoding="utf-8") as f:
+                    json.dump(data, f, ensure_ascii=False)
+            else:
+                print(f"❌ 下載失敗 (Status: {response.status_code})", flush=True)
+        except Exception as e:
+            print(f"❌ 下載錯誤: {e}", flush=True)
+
+    # 3. 執行簡轉繁與清洗
+    if data:
+        for dish in data:
+            new_dish = dish.copy()
+            # 安全轉換：先檢查欄位是否存在
+            if "name" in new_dish:
+                new_dish["name"] = cc.convert(new_dish["name"])
+            if "description" in new_dish:
+                new_dish["description"] = cc.convert(new_dish["description"])
+            if "ingredients" in new_dish:
+                new_dish["ingredients"] = cc.convert(str(new_dish["ingredients"]))
+            cleaned.append(new_dish)
+        
+        CACHED_RECIPES = cleaned
+        print(f"✅ 食譜載入並繁體化完成！共 {len(CACHED_RECIPES)} 道。", flush=True)
+        
+        # ==== 🔥 新增：第二層向量化 (針對菜名) ====
+        # 只有在有食譜時才建立索引
+        if CACHED_RECIPES:
+            print("🍳 正在為食譜名稱建立專屬向量索引...", flush=True)
+            try:
+                # 提取所有菜名
+                recipe_names = [r['name'] for r in CACHED_RECIPES]
+                
+                # 轉成 Tensor
+                RECIPE_EMBEDDINGS = embedding_model.encode(recipe_names, convert_to_tensor=True)
+                print(f"✅ 食譜向量索引建立完成！(Shape: {RECIPE_EMBEDDINGS.shape})", flush=True)
+
+                # 動態注入意圖 (讓第一層分類更準)
+                if "search_recipe" in INTENT_KNOWLEDGE_BASE:
+                    INTENT_KNOWLEDGE_BASE["search_recipe"].extend(recipe_names)
+                    print(f"💉 已注入 {len(recipe_names)} 個菜名到意圖系統。", flush=True)
+            except Exception as e:
+                print(f"❌ 建立向量索引時發生錯誤: {e}", flush=True)
+
+    else:
+        print("⚠️ 警告：無法載入食譜，機器人將無法辨識特定菜名。", flush=True)
+
+# ---- 執行啟動載入 ----
+startup_load_recipes()
+
+# ---- 接著才做向量化 ----
+print("🧠 正在將意圖資料庫轉為向量 (BGE-M3)...", flush=True)
+corpus_sentences = []
+intent_map = [] 
+
+for intent, examples in INTENT_KNOWLEDGE_BASE.items():
+    for example in examples:
+        corpus_sentences.append(example)
+        intent_map.append(intent)
+
+corpus_embeddings = embedding_model.encode(corpus_sentences, convert_to_tensor=True)
+print("✅ BGE-M3 初始化完成！向量空間已建立。", flush=True)
 
 # ---- 配置與常數 (Configuration & Constants) ----
 
@@ -85,7 +305,7 @@ else:
 # 模型優先順序清單
 # 邏輯：優先使用穩定且快速的模型 (Flash)，其次是強大的模型 (Pro)，
 # 若都失敗則使用實驗性或輕量模型。
-MODEL_PRIORITY = [
+MODEL_PRIORITY: List[str] = [
     # 第一梯隊：最強大腦 (High Intelligence)
     "gemini-2.5-pro",         # 次強模型
 
@@ -150,13 +370,13 @@ class ChatHistory(db.Model):
 
 # ---- 輔助函式 (Helper Functions) ----
 
-def generate_content_safe(prompt_parts: Union[str, List[str]]) -> Any:
+def generate_content_safe(prompt_parts: Union[str, List[Any]]) -> Any:
     """
     依序嘗試 MODEL_PRIORITY 中的模型來生成內容。
     包含完整的錯誤處理，特別是針對模型不存在 (404) 的情況。
 
     Args:
-        prompt_parts: 提示詞內容，可以是字串或字串列表。
+        prompt_parts: 提示詞內容，可以是字串、字串列表，或包含圖片資料的混合列表。
 
     Returns:
         Gemini API 的回應物件。
@@ -198,7 +418,6 @@ def generate_content_safe(prompt_parts: Union[str, List[str]]) -> Any:
         except Exception as e:
             logger.error(f"模型 {model_name} 發生非預期錯誤: {e}")
             # 若發生未知錯誤，為避免無限迴圈或邏輯錯誤，這裡選擇拋出異常
-            # 或者也可以選擇 continue，視需求而定
             last_error = str(e)
             continue 
 
@@ -207,20 +426,71 @@ def generate_content_safe(prompt_parts: Union[str, List[str]]) -> Any:
 
 def ensure_recipes_loaded() -> None:
     """
-    確保食譜資料已經下載到記憶體中。
+    [修正版] 讀取本地 recipes.json，並強制將內容轉換為繁體中文。
     """
     global CACHED_RECIPES
-    if not CACHED_RECIPES:
-        logger.info("正在下載食譜資料庫...")
+    
+    # 如果已經有資料，就不用再讀了 (避免重複讀取覆蓋)
+    if CACHED_RECIPES:
+        return
+
+    # 1. 先嘗試讀取本地檔案
+    if os.path.exists("recipes.json"):
+        logger.info("發現本地食譜檔案，正在讀取並進行繁體化...")
         try:
-            response = requests.get(RECIPES_URL, timeout=15)
-            if response.status_code == 200:
-                CACHED_RECIPES = response.json()
-                logger.info(f"食譜下載成功！共有 {len(CACHED_RECIPES)} 道菜")
-            else:
-                logger.error(f"食譜下載失敗，狀態碼: {response.status_code}")
+            with open("recipes.json", "r", encoding="utf-8") as f:
+                raw_data = json.load(f)
+            
+            # ==== 關鍵修改：在這裡進行簡轉繁 ====
+            cleaned_recipes = []
+            for dish in raw_data:
+                new_dish = dish.copy()
+                # 針對可能出現簡體的欄位進行轉換
+                if "name" in new_dish:
+                    new_dish["name"] = cc.convert(new_dish["name"])
+                if "description" in new_dish:
+                    new_dish["description"] = cc.convert(new_dish["description"])
+                if "ingredients" in new_dish:
+                    new_dish["ingredients"] = cc.convert(str(new_dish["ingredients"]))
+                
+                cleaned_recipes.append(new_dish)
+            # =================================
+            
+            CACHED_RECIPES = cleaned_recipes
+            logger.info(f"本地食譜載入並轉繁體成功！共有 {len(CACHED_RECIPES)} 道菜")
+            return
+            
         except Exception as e:
-            logger.error(f"下載食譜時發生錯誤: {e}")
+            logger.error(f"讀取本地食譜失敗: {e}，將嘗試網路下載...")
+
+    # 2. 如果本地沒有，才去網路下載 (網路下載的也要轉繁體)
+    logger.info("正在從網路下載食譜資料庫...")
+    try:
+        response = requests.get(RECIPES_URL, timeout=60)
+        if response.status_code == 200:
+            raw_data = response.json()
+            
+            # ==== 網路下載的也要轉 ====
+            cleaned_recipes = []
+            for dish in raw_data:
+                new_dish = dish.copy()
+                if "name" in new_dish:
+                    new_dish["name"] = cc.convert(new_dish["name"])
+                if "description" in new_dish:
+                    new_dish["description"] = cc.convert(new_dish["description"])
+                cleaned_recipes.append(new_dish)
+            # =======================
+
+            CACHED_RECIPES = cleaned_recipes
+            logger.info(f"網路食譜下載成功！共有 {len(CACHED_RECIPES)} 道菜")
+            
+            # 順便存檔 (建議存轉好的繁體版，下次讀取就不用轉了)
+            with open("recipes.json", "w", encoding="utf-8") as f:
+                json.dump(CACHED_RECIPES, f, ensure_ascii=False)
+        else:
+            logger.error(f"食譜下載失敗，狀態碼: {response.status_code}")
+    except Exception as e:
+        logger.error(f"下載食譜時發生錯誤: {e}")
 
 
 def normalize_city(text: str) -> Optional[str]:
@@ -445,7 +715,6 @@ def suggest_recipe_by_ingredients(user_id: str, ingredients: str) -> str:
     if not CACHED_RECIPES:
         return "食譜資料庫連線失敗。"
 
-    # 簡單 RAG：取前 20 筆作為上下文 (可優化為語意搜尋)
     sample_recipes = CACHED_RECIPES[:20] 
     recipe_names = "\n".join([f"・{r['name']} ({r.get('category', '未分類')})" for r in sample_recipes])
     
@@ -467,7 +736,6 @@ def suggest_recipe_by_ingredients(user_id: str, ingredients: str) -> str:
     
     try:
         response = generate_content_safe(prompt)
-        # 檢查回應是否有效
         if response.candidates and response.candidates[0].content and response.candidates[0].content.parts:
             return response.text
         else:
@@ -637,95 +905,146 @@ def get_nearby_places(lat: float, lng: float) -> Union[Dict[str, Any], Dict[str,
 
 def analyze_intent(user_text: str) -> Dict[str, Any]:
     """
-    使用 AI 判斷使用者意圖 (Intent Classification)。
+    [新版] 使用 BGE-M3 向量相似度來判斷使用者意圖，並提取關鍵字。
     """
-    if not GOOGLE_API_KEY:
-        return {"intent": "chat", "reply": "AI 維修中"}
-        
-    prompt = f"""
-    你是 LINE Bot 的大腦。請分析使用者的輸入：「{user_text}」
+    # 1. 將使用者輸入轉為向量
+    query_embedding = embedding_model.encode(user_text, convert_to_tensor=True)
     
-    請判斷使用者的意圖，並嚴格依照以下 JSON 格式回傳，不要有任何其他廢話：
+    # 2. 計算相似度 (Cosine Similarity)
+    cos_scores = util.cos_sim(query_embedding, corpus_embeddings)[0]
     
-    1. 如果使用者想找食譜、學做菜、問作法 (例如：教我煮三杯雞、我想吃宮保雞丁、番茄炒蛋怎麼弄)：
-       回傳：{{"intent": "search_recipe", "keyword": "擷取出的菜名"}}
-       
-    2. 如果使用者想隨機抽食譜 (例如：今天吃什麼、晚餐吃什麼、隨便推薦一道)：
-       回傳：{{"intent": "random_recipe"}}
-       
-    3. 如果使用者想問天氣 (例如：台北天氣如何、外面會下雨嗎)：
-       回傳：{{"intent": "weather", "location": "擷取出的縣市名稱(若無則回傳null)"}}
-       
-    4. 如果使用者想問穿搭 (例如：今天穿什麼、好冷要穿這嗎)：
-       回傳：{{"intent": "clothing_advice"}}
-       
-    5. 如果使用者想根據現有食材推薦菜色 (例如：我只有雞蛋和番茄可以做什麼、冰箱只剩豆腐)：
-       回傳：{{"intent": "suggest_by_ingredients", "ingredients": "擷取出的食材清單 (以逗號分隔)"}}
+    # 3. 找出最高分的那個
+    best_score = torch.max(cos_scores)
+    best_idx = torch.argmax(cos_scores).item()
+    predicted_intent = intent_map[best_idx]
     
-    6. 如果使用者想問今日運勢、抽籤、問運氣、或問美食/穿搭的運氣 (例如：今天運氣如何、抽籤、今日運勢)：
-       回傳：{{"intent": "fortune"}}
-
-    7. 如果使用者想問食材替代品 (例如：醬油可以用什麼代替、沒有雞蛋怎麼辦、香菜的替代品)：
-       回傳：{{"intent": "substitute_ingredient", "target": "擷取出的目標食材或調味料"}}
-
-    8. 如果使用者問附近哪裡好玩、推薦景點 (例如：這附近有什麼好玩的、推薦附近景點)：
-       回傳：{{"intent": "search_nearby"}}
-
-    9. 其他閒聊或無法判斷：
-       回傳：{{"intent": "chat"}}
-    """
+    logger.info(f"輸入: '{user_text}' | 匹配: '{corpus_sentences[best_idx]}' | 意圖: {predicted_intent} | 分數: {best_score:.4f}")
     
-    try:
-        response = generate_content_safe(prompt)
-        # 清理回應，確保是乾淨的 JSON
-        clean_text = response.text.replace("```json", "").replace("```", "").strip()
-        return json.loads(clean_text)
-    except Exception as e:
-        logger.error(f"意圖辨識失敗: {e}")
+    # 4. 設定門檻值 (建議 0.5 ~ 0.55)
+    # 如果分數太低，代表使用者說的話不在我們的守備範圍，轉交給閒聊模式
+    if best_score < 0.65:
         return {"intent": "chat"}
 
+    # ---- 5. 參數萃取 (Parameter Extraction) ----
+    # 這裡是透過簡單的規則 (Rule-based) 從句子中挖出參數
+    
+    result = {"intent": predicted_intent}
 
-def search_recipe_by_ai(keyword: str) -> str:
+    # (A) 地點相關：天氣、穿搭、附近景點
+    # 邏輯：掃描全域變數 CITY_ALIASES 看有沒有命中
+    if predicted_intent in ["weather", "clothing_advice", "search_nearby"]:
+        found_city = None
+        for alias, real_name in CITY_ALIASES.items():
+            if alias in user_text:
+                found_city = real_name
+                break
+        result["location"] = found_city  # 如果沒抓到會是 None，主程式會去抓使用者的預設地區
+
+    # (B) 查詢食譜
+    # 邏輯：把「食譜、教我、怎麼做」這些功能詞刪掉，剩下的就是菜名
+    elif predicted_intent == "search_recipe":
+        stop_words = [
+            "食譜", "教我", "做法", "作法", "怎麼做", "怎麼煮", "製作", 
+            "我想吃", "有沒有", "幫我找", "查詢", "教學"
+        ]
+        clean_text = user_text
+        for word in stop_words:
+            clean_text = clean_text.replace(word, "")
+        
+        # 如果刪完變空字串 (例如使用者只打"食譜")，就回傳原文以免報錯
+        result["keyword"] = clean_text.strip() if clean_text.strip() else user_text
+
+    # (C) 冰箱剩菜/食材推薦
+    # 邏輯：把「冰箱、只剩、我有」刪掉，剩下的就是食材清單
+    elif predicted_intent == "suggest_by_ingredients":
+        stop_words = [
+            "冰箱", "只剩", "剩下", "只有", "我有", "可以做什麼", 
+            "料理", "推薦", "幫我想", "食材"
+        ]
+        clean_text = user_text
+        for word in stop_words:
+            clean_text = clean_text.replace(word, "")
+        result["ingredients"] = clean_text.strip()
+
+    # (D) 食材替代
+    # 邏輯：把「替代、沒有」刪掉
+    elif predicted_intent == "substitute_ingredient":
+        stop_words = [
+            "沒有", "缺", "少了", "可以用", "什麼", "代替", "替代", 
+            "換成", "怎麼辦"
+        ]
+        clean_text = user_text
+        for word in stop_words:
+            clean_text = clean_text.replace(word, "")
+        result["target"] = clean_text.strip()
+
+    # (E) 隨機食譜 (目前不需要參數，但也預留擴充空間)
+    elif predicted_intent == "random_recipe":
+        # 未來可以抓取 "晚餐"、"午餐" 等關鍵字
+        pass
+
+    return result
+
+
+def search_recipe_by_ai(user_text: str) -> str:
     """
-    食譜查詢 (RAG 核心邏輯)。
+    [升級版] 第二階段檢索：使用向量相似度搜尋食譜。
+    優點：抗錯字、抗簡繁差異、懂語意 (辣辣的雞 -> 宮保雞丁)。
     """
+    global CACHED_RECIPES, RECIPE_EMBEDDINGS
+    
     if not GOOGLE_API_KEY:
         return "抱歉，AI 功能目前無法使用。"
     
+    # 確保資料已載入
     ensure_recipes_loaded()
-    if not CACHED_RECIPES:
-        return "食譜資料庫連線失敗。"
+    if not CACHED_RECIPES or RECIPE_EMBEDDINGS is None:
+        return "食譜資料庫尚未建立索引。"
 
-    # 檢索 (模糊搜尋)
-    found_dishes = [r for r in CACHED_RECIPES if keyword in r.get('name', '')]
+    # 1. 將使用者的輸入 (例如: "教我做宫保鸡丁") 轉成向量
+    # 注意：這裡不需要刻意清洗關鍵字，直接丟整句也可以，BGE-M3 很強
+    # 但如果前面有 analyze_intent 洗出來的 keyword 更好
+    query_embedding = embedding_model.encode(user_text, convert_to_tensor=True)
     
-    if not found_dishes:
-        return f"抱歉，我在食譜資料庫裡找不到「{keyword}」。試試看別的關鍵字？（例如：雞肉、番茄）"
+    # 2. 計算相似度 (Query vs 所有菜名)
+    # cos_sim 回傳的是一個矩陣，我們取 [0] 代表第一個 query 的結果
+    cos_scores = util.cos_sim(query_embedding, RECIPE_EMBEDDINGS)[0]
     
-    # 取第一個最相關的
-    target_dish = found_dishes[0]
+    # 3. 找出分數最高的那個
+    best_score = torch.max(cos_scores)
+    best_idx = torch.argmax(cos_scores).item()
     
-    # 準備 Prompt (RAG Augmentation)
+    target_dish = CACHED_RECIPES[best_idx]
+    dish_name = target_dish['name']
+    
+    logger.info(f"食譜搜尋: '{user_text}' -> 匹配: '{dish_name}' | 分數: {best_score:.4f}")
+    
+    # 4. 設定門檻值 (Threshold)
+    # 建議設在 0.6 ~ 0.7 之間，因為是針對特定領域的搜尋
+    if best_score < 0.65:
+        return f"抱歉，我找不到跟「{user_text}」相關的食譜。要不要換個說法試試？"
+
+    # ==========================================
+    # 以下是原本的 Gemini RAG 生成邏輯 (完全不用動)
+    # ==========================================
     dish_data_str = json.dumps(target_dish, ensure_ascii=False)
     
     prompt = f"""
     你現在是一位專業的五星級大廚。
-    
-    使用者想知道「{target_dish['name']}」的作法。
+    使用者想知道「{dish_name}」的作法。
     
     以下是這道菜的詳細原始資料 (JSON 格式)：
     {dish_data_str}
     
     任務：
     請根據上面的原始資料，執行以下步驟：
-    1. **徹底執行資料清洗與標準化**，忽略資料中的亂碼或不一致的格式。
-    2. 將所有內容（包括食材名稱、步驟說明）**翻譯為高質量、流暢的繁體中文**。
-    3. 用親切、易懂的方式，寫一份完整的食譜教學給使用者。
+    1. 將所有內容翻譯為高質量、流暢的繁體中文。
+    2. 用親切、易懂的方式，寫一份完整的食譜教學。
     
     格式要求：
-    1. 開頭先用一句話介紹這道菜。
-    2. 列出「食材清單」(請整理好份量，統一單位)。
-    3. 列出「詳細步驟」(請加上編號，並把步驟寫得清楚好操作)。
+    1. 開頭先介紹這道菜。
+    2. 列出「食材清單」。
+    3. 列出「詳細步驟」。
     4. 最後給一個「大廚小撇步」。
     """
     
@@ -759,8 +1078,10 @@ def webhook() -> str:
         abort(400)
         return "Invalid Signature"
 
+    # 使用 ApiClient 初始化 MessagingApi 與 MessagingApiBlob (處理多媒體)
     with ApiClient(configuration) as api_client:
         line_bot_api = MessagingApi(api_client)
+        line_bot_blob_api = MessagingApiBlob(api_client) # 新增 Blob API 支援
         
         # 定義功能選單 (Quick Reply)
         feature_quick_reply = QuickReply(
@@ -783,6 +1104,10 @@ def webhook() -> str:
             # 處理位置訊息
             elif isinstance(event, MessageEvent) and isinstance(event.message, LocationMessageContent):
                 handle_location_message(event, line_bot_api)
+            
+            # 處理圖片訊息 (新增)
+            elif isinstance(event, MessageEvent) and isinstance(event.message, ImageMessageContent):
+                handle_image_message(event, line_bot_api, line_bot_blob_api)
 
     return "OK"
 
@@ -970,6 +1295,60 @@ def handle_location_message(event: MessageEvent, line_bot_api: MessagingApi) -> 
         ReplyMessageRequest(
             reply_token=event.reply_token,
             messages=[reply_msg]
+        )
+    )
+
+
+def handle_image_message(event: MessageEvent, line_bot_api: MessagingApi, line_bot_blob_api: MessagingApiBlob) -> None:
+    """
+    處理圖片訊息：辨識食材並推薦食譜 (Gemini Vision)。
+    """
+    user_id = event.source.user_id
+    message_id = event.message.id
+    reply_token = event.reply_token
+
+    # 1. 取得圖片內容 (Binary)
+    try:
+        logger.info(f"正在下載圖片: {message_id}")
+        message_content = line_bot_blob_api.get_message_content(message_id)
+        # message_content 本身是 bytes
+    except Exception as e:
+        logger.error(f"下載圖片失敗: {e}")
+        return
+
+    # 2. 準備 Prompt 與 圖片資料
+    # Gemini 接受 {'mime_type': '...', 'data': bytes} 的格式
+    image_part = {
+        'mime_type': 'image/jpeg', 
+        'data': message_content
+    }
+    
+    prompt = """
+    請扮演一位專業的「食材辨識與料理顧問」。
+    
+    請仔細觀察這張圖片：
+    1. **辨識食材**：列出你看到的所有食材。
+    2. **推薦料理**：根據這些食材，推薦 1 道最適合的料理。
+    3. **簡易作法**：用 3 個步驟簡單說明這道菜怎麼做。
+    
+    請用親切、活潑的語氣回覆，並加上表情符號。
+    如果圖片中沒有食材，請幽默地回應使用者。
+    """
+
+    # 3. 呼叫 Gemini (Vision)
+    # 我們可以直接使用 generate_content_safe，因為它支援傳入 list
+    try:
+        response = generate_content_safe([prompt, image_part])
+        reply_text = response.text
+    except Exception as e:
+        logger.error(f"Gemini 圖片辨識失敗: {e}")
+        reply_text = "抱歉，我看不太清楚這張圖片裡的食材，可以再拍清楚一點嗎？😅"
+
+    # 4. 回覆使用者
+    line_bot_api.reply_message(
+        ReplyMessageRequest(
+            reply_token=reply_token,
+            messages=[TextMessage(text=reply_text)]
         )
     )
 
