@@ -203,34 +203,100 @@ def analyze_intent(user_text: str) -> Dict[str, Any]:
     return result
 
 def search_recipe_by_ai(user_text: str) -> str:
+    """
+    [無限食譜模式]
+    1. 先嘗試向量搜尋資料庫 (RAG) -> 求精準。
+    2. 如果找不到 (分數低)，則切換為純生成模式 (GenAI) -> 求有求必應。
+    """
     global CACHED_RECIPES, RECIPE_EMBEDDINGS
     
+    if not GOOGLE_API_KEY:
+        return "抱歉，AI 功能目前無法使用。"
+    
+    # 確保資料庫有載入 (雖然如果沒載入我們現在也能生成，但還是嘗試載入一下)
     ensure_recipes_loaded()
-    if not CACHED_RECIPES or RECIPE_EMBEDDINGS is None:
-        return "食譜資料庫尚未建立索引。"
 
-    query_embedding = embedding_model.encode(user_text, convert_to_tensor=True)
-    cos_scores = util.cos_sim(query_embedding, RECIPE_EMBEDDINGS)[0]
-    best_score = torch.max(cos_scores)
-    best_idx = torch.argmax(cos_scores).item()
+    # 預設變數
+    best_score = -1.0
+    target_dish = None
     
-    target_dish = CACHED_RECIPES[best_idx]
-    dish_name = target_dish['name']
+    # ---------------------------------------------------------
+    # 階段一：嘗試在「本地資料庫」尋找
+    # ---------------------------------------------------------
+    if CACHED_RECIPES and RECIPE_EMBEDDINGS is not None:
+        try:
+            # 將使用者的輸入轉成向量
+            query_embedding = embedding_model.encode(user_text, convert_to_tensor=True)
+            
+            # 計算相似度
+            cos_scores = util.cos_sim(query_embedding, RECIPE_EMBEDDINGS)[0]
+            best_score = torch.max(cos_scores).item()
+            best_idx = torch.argmax(cos_scores).item()
+            
+            # 暫存找到的食譜
+            target_dish = CACHED_RECIPES[best_idx]
+            dish_name = target_dish.get('name', '未知料理')
+            
+            logger.info(f"向量搜尋: '{user_text}' -> 最接近: '{dish_name}' (分數: {best_score:.4f})")
+        except Exception as e:
+            logger.error(f"向量搜尋過程發生錯誤: {e}")
+            # 出錯也沒關係，直接往下走去給 AI 生成
     
-    logger.info(f"食譜搜尋: '{user_text}' -> '{dish_name}' ({best_score:.4f})")
+    # ---------------------------------------------------------
+    # 階段二：決策與生成 (RAG vs GenAI)
+    # ---------------------------------------------------------
     
-    if best_score < 0.65:
-        return f"抱歉，我找不到跟「{user_text}」相關的食譜。"
+    # 門檻值設定 (0.65 代表有一定程度的相關)
+    THRESHOLD = 0.65
 
-    dish_data_str = json.dumps(target_dish, ensure_ascii=False)
-    prompt = f"你是專業大廚。請將此食譜資料：{dish_data_str}，整理成繁體中文教學。包含介紹、食材、步驟、小撇步。"
-    
+    # 【情況 A：資料庫有這道菜】(分數夠高)
+    if best_score >= THRESHOLD and target_dish:
+        logger.info(f"✅ 資料庫命中！使用 RAG 生成教學。")
+        
+        dish_data_str = json.dumps(target_dish, ensure_ascii=False)
+        
+        prompt = f"""
+        你現在是一位專業的五星級大廚。
+        使用者想知道「{target_dish['name']}」的作法。
+        
+        我已經從資料庫找到了這道菜的詳細資料 (JSON)：
+        {dish_data_str}
+        
+        任務：
+        請根據上述資料，將內容整理並翻譯為高質量、流暢的繁體中文食譜。
+        包含：菜名介紹、食材清單(含份量)、詳細步驟、大廚小撇步。
+        """
+        
+    # 【情況 B：資料庫沒這道菜】(分數太低 或 資料庫是空的)
+    else:
+        logger.info(f"⚠️ 資料庫無相符食譜 (分數 {best_score:.4f} < {THRESHOLD})，切換至 AI 純生成模式...")
+        
+        prompt = f"""
+        你是世界級的創意主廚。
+        使用者想學習一道料理：「{user_text}」。
+        
+        雖然我的食譜資料庫裡沒有這道菜的紀錄，但請你**憑藉你豐富的烹飪知識**，現場為使用者創作一份食譜。
+        
+        格式要求 (請嚴格遵守，讓使用者看不出差別)：
+        1. **菜名**：請幫這道菜取一個好聽的名字 (例如：✨ 特製{user_text} )。
+        2. **簡介**：一句話介紹這道菜的特色。
+        3. **食材清單**：條列式，估算大約的食材與份量。
+        4. **詳細步驟**：清楚的烹飪流程，確保邏輯正確能執行。
+        5. **大廚小撇步**：讓這道菜更好吃的秘訣。
+        
+        請用親切、活潑的繁體中文回答。
+        (請在開頭加一個 🧑‍🍳 Emoji 表示這是大廚特製版)
+        """
+
+    # ---------------------------------------------------------
+    # 階段三：呼叫 Gemini 生成
+    # ---------------------------------------------------------
     try:
         response = generate_content_safe(prompt)
         return response.text
     except Exception as e:
-        logger.error(f"生成失敗: {e}")
-        return "AI 生成食譜時發生錯誤。"
+        logger.error(f"AI 生成食譜失敗: {e}")
+        return "大廚現在忙不過來，鍋子燒焦了... 請稍後再試一次！🥵"
 
 # ==========================================
 # 4. 其他 AI 服務 (補齊原本 app.py 遺失的功能)
