@@ -6,4 +6,5 @@ requests
 certifi
 google-generativeai
 psycopg2-binary
-Flask-SQLAlchemy
+Flask-SQLAlchemysentence_transformers
+opencc-python-reimplemented
